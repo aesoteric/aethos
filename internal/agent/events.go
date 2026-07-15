@@ -3,6 +3,8 @@
 // everything else consumes the aethos-owned event types defined here.
 package agent
 
+import "context"
+
 // Event is one observable occurrence streamed from an Agent during a
 // prompt turn, translated from the ACP protocol into aethos vocabulary.
 type Event interface{ isEvent() }
@@ -34,10 +36,11 @@ func (Message) isEvent()            {}
 func (ToolCallBegan) isEvent()      {}
 func (ToolCallProgressed) isEvent() {}
 
-// EventHandler receives every translated Event of a Conn in arrival
-// order, tagged with the id of the session it belongs to. Handlers run
-// on the connection's goroutine: blocking here blocks the agent stream.
-type EventHandler func(sessionID string, ev Event)
+// EventHandler receives every translated Event of a Conn in arrival order,
+// tagged with the id of the session it belongs to. Handlers run on the
+// connection's goroutine: blocking here blocks the Agent stream, and returning
+// an error fails the current protocol operation.
+type EventHandler func(context.Context, string, Event) error
 
 // StopReason says why an agent ended a prompt turn.
 type StopReason string

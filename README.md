@@ -44,6 +44,17 @@ and log paths are all rooted there. Environment values override the file:
 Invalid TOML, unknown fields, and missing required values stop startup with an
 actionable error.
 
+## Session durability
+
+Session records live in `aethos.db` under the data directory. Each record keeps
+the Agent, Workspace, owner identity, lifecycle state, and activity timestamps.
+Live Sessions become dormant during shutdown and transparently resume their ACP
+Session on the next Prompt after a restart.
+
+Prompts are processed in arrival order within each Session. The waiting queue is
+intentionally in memory: a restart drops Prompts that had not started, while the
+durable Session record and Agent context remain available for the next Prompt.
+
 ## Development
 
 Requires Go 1.24+.
@@ -57,6 +68,13 @@ To push one Prompt through a real, locally installed ACP agent and watch its out
 
 ```sh
 ./aethos dev prompt -agent "npx @zed-industries/claude-code-acp" -workspace . "say hello"
+```
+
+The command persists the Session under the normal data directory and logs its
+ID. A later binary invocation resumes the same Agent context:
+
+```sh
+./aethos dev prompt -session <session-id> "continue where we left off"
 ```
 
 Structured JSON logs go to stderr; set `AETHOS_LOG_LEVEL=debug` for protocol-level detail.

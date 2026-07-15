@@ -2,11 +2,13 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os/exec"
 	"strings"
+	"sync"
 
 	sdk "github.com/coder/acp-go-sdk"
 )
@@ -14,17 +16,24 @@ import (
 // Conn is one live connection to a running Agent, either spawned as a
 // subprocess (Spawn) or wired over in-process pipes (ConnectScript).
 type Conn struct {
-	sdk      *sdk.ClientSideConnection
-	logger   *slog.Logger
-	onEvent  EventHandler
-	shutdown func() error
+	sdk          *sdk.ClientSideConnection
+	capabilities sdk.AgentCapabilities
+	logger       *slog.Logger
+	onEvent      EventHandler
+	shutdown     func() error
+	closeOnce    sync.Once
+	closeErr     error
+	eventMu      sync.Mutex
+	eventErrors  map[string]error
 }
 
 // Spawn launches an ACP agent subprocess, connects over its stdio, and
 // performs the protocol handshake. The agent's stderr is forwarded to
 // the logger at debug level.
 func Spawn(ctx context.Context, logger *slog.Logger, onEvent EventHandler, name string, args ...string) (*Conn, error) {
-	cmd := exec.CommandContext(ctx, name, args...)
+	// Conn owns the subprocess lifetime. The caller's context bounds startup and
+	// protocol operations; Close is the single place that terminates the Agent.
+	cmd := exec.Command(name, args...)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, fmt.Errorf("agent stdin: %w", err)
@@ -56,13 +65,17 @@ func connect(ctx context.Context, logger *slog.Logger, onEvent EventHandler, pee
 	c := &Conn{logger: logger, onEvent: onEvent, shutdown: shutdown}
 	c.sdk = sdk.NewClientSideConnection(&client{conn: c}, peerIn, peerOut)
 	c.sdk.SetLogger(logger)
-	if _, err := c.sdk.Initialize(ctx, sdk.InitializeRequest{
+	initialized, err := c.sdk.Initialize(ctx, sdk.InitializeRequest{
 		ProtocolVersion: sdk.ProtocolVersionNumber,
 		ClientInfo:      &sdk.Implementation{Name: "aethos", Version: "dev"},
-	}); err != nil {
-		_ = c.Close()
-		return nil, fmt.Errorf("initialize agent: %w", err)
+	})
+	if err != nil {
+		return nil, errors.Join(
+			fmt.Errorf("initialize Agent: %w", err),
+			wrapError("close Agent", c.Close()),
+		)
 	}
+	c.capabilities = initialized.AgentCapabilities
 	return c, nil
 }
 
@@ -79,27 +92,91 @@ func (c *Conn) NewSession(ctx context.Context, workspace string) (string, error)
 	return string(resp.SessionId), nil
 }
 
+// ResumeSession attaches this connection to an Agent Session created by an
+// earlier Agent process. The non-replaying ACP resume method is preferred;
+// Agents that only implement the older load capability use that instead.
+func (c *Conn) ResumeSession(ctx context.Context, sessionID, workspace string) error {
+	switch {
+	case c.capabilities.SessionCapabilities.Resume != nil:
+		_, err := c.sdk.ResumeSession(ctx, sdk.ResumeSessionRequest{
+			SessionId:  sdk.SessionId(sessionID),
+			Cwd:        workspace,
+			McpServers: []sdk.McpServer{},
+		})
+		if err != nil {
+			return fmt.Errorf("resume session: %w", err)
+		}
+		return nil
+	case c.capabilities.LoadSession:
+		_, err := c.sdk.LoadSession(ctx, sdk.LoadSessionRequest{
+			SessionId:  sdk.SessionId(sessionID),
+			Cwd:        workspace,
+			McpServers: []sdk.McpServer{},
+		})
+		if err != nil {
+			return fmt.Errorf("load session: %w", err)
+		}
+		return nil
+	default:
+		return fmt.Errorf("resume session: Agent supports neither session/resume nor session/load")
+	}
+}
+
 // Prompt dispatches one Prompt to a session and blocks until the turn
 // ends. Events stream to the EventHandler while it runs; the SDK
 // guarantees every event sent before the turn ended has been handled by
 // the time Prompt returns.
 func (c *Conn) Prompt(ctx context.Context, sessionID, text string) (StopReason, error) {
+	c.clearEventError(sessionID)
 	resp, err := c.sdk.Prompt(ctx, sdk.PromptRequest{
 		SessionId: sdk.SessionId(sessionID),
 		Prompt:    []sdk.ContentBlock{sdk.TextBlock(text)},
 	})
-	if err != nil {
-		return "", fmt.Errorf("prompt: %w", err)
+	eventErr := c.takeEventError(sessionID)
+	if err != nil || eventErr != nil {
+		return "", errors.Join(wrapError("prompt", err), eventErr)
 	}
 	return StopReason(resp.StopReason), nil
 }
 
-// Close tears down the connection and, for spawned agents, the subprocess.
-func (c *Conn) Close() error {
-	if c.shutdown == nil {
+func (c *Conn) clearEventError(sessionID string) {
+	c.eventMu.Lock()
+	defer c.eventMu.Unlock()
+	delete(c.eventErrors, sessionID)
+}
+
+func (c *Conn) recordEventError(sessionID string, err error) {
+	c.eventMu.Lock()
+	defer c.eventMu.Unlock()
+	if c.eventErrors == nil {
+		c.eventErrors = make(map[string]error)
+	}
+	c.eventErrors[sessionID] = errors.Join(c.eventErrors[sessionID], err)
+}
+
+func (c *Conn) takeEventError(sessionID string) error {
+	c.eventMu.Lock()
+	defer c.eventMu.Unlock()
+	err := c.eventErrors[sessionID]
+	delete(c.eventErrors, sessionID)
+	return err
+}
+
+func wrapError(operation string, err error) error {
+	if err == nil {
 		return nil
 	}
-	return c.shutdown()
+	return fmt.Errorf("%s: %w", operation, err)
+}
+
+// Close tears down the connection and, for spawned agents, the subprocess.
+func (c *Conn) Close() error {
+	c.closeOnce.Do(func() {
+		if c.shutdown != nil {
+			c.closeErr = c.shutdown()
+		}
+	})
+	return c.closeErr
 }
 
 // client receives the agent's ACP callbacks and translates session
@@ -110,7 +187,10 @@ var _ sdk.Client = (*client)(nil)
 
 func (cl *client) SessionUpdate(ctx context.Context, n sdk.SessionNotification) error {
 	if ev, ok := translate(n.Update); ok {
-		cl.conn.onEvent(string(n.SessionId), ev)
+		sessionID := string(n.SessionId)
+		if err := cl.conn.onEvent(ctx, sessionID, ev); err != nil {
+			cl.conn.recordEventError(sessionID, err)
+		}
 	}
 	return nil
 }

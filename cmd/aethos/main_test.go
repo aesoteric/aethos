@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/aesoteric/aethos/internal/agent"
 	"github.com/aesoteric/aethos/internal/telegram"
 )
 
@@ -38,6 +40,70 @@ func TestRunRejectsBadInvocationsWithUsage(t *testing.T) {
 				t.Error("no usage text written to stderr")
 			}
 		})
+	}
+}
+
+func TestDevPromptPersistsAndResumesSession(t *testing.T) {
+	script := agent.Script{Turns: []agent.Turn{
+		{
+			WantPrompt:  "remember blue",
+			WantHistory: []string{"remember blue"},
+			Events:      []agent.Event{agent.Message{Text: "remembered"}},
+			Stop:        agent.StopEndTurn,
+		},
+		{
+			WantPrompt:  "what was it?",
+			WantHistory: []string{"remember blue", "what was it?"},
+			Events:      []agent.Event{agent.Message{Text: "blue"}},
+			Stop:        agent.StopEndTurn,
+		},
+	}}
+	connect := func(ctx context.Context, _ string, onEvent agent.EventHandler) (*agent.Conn, error) {
+		return agent.ConnectScript(ctx, slog.New(slog.DiscardHandler), onEvent, &script)
+	}
+	dataDir := t.TempDir()
+	workspace := t.TempDir()
+	logger := slog.New(slog.DiscardHandler)
+
+	var firstOutput strings.Builder
+	sessionID, err := devPromptWithConnector(
+		t.Context(),
+		logger,
+		[]string{"-data-dir", dataDir, "-agent", "codex-acp", "-workspace", workspace, "remember blue"},
+		&firstOutput,
+		io.Discard,
+		connect,
+	)
+	if err != nil {
+		t.Fatalf("first dev Prompt: %v", err)
+	}
+	if sessionID == "" {
+		t.Fatal("first dev Prompt returned an empty Session ID")
+	}
+	if firstOutput.String() != "remembered\n" {
+		t.Errorf("first output = %q, want %q", firstOutput.String(), "remembered\\n")
+	}
+	if _, err := os.Stat(filepath.Join(dataDir, "aethos.db")); err != nil {
+		t.Fatalf("durable Session database: %v", err)
+	}
+
+	var secondOutput strings.Builder
+	resumedID, err := devPromptWithConnector(
+		t.Context(),
+		logger,
+		[]string{"-data-dir", dataDir, "-session", sessionID, "what was it?"},
+		&secondOutput,
+		io.Discard,
+		connect,
+	)
+	if err != nil {
+		t.Fatalf("resumed dev Prompt: %v", err)
+	}
+	if resumedID != sessionID {
+		t.Errorf("resumed Session ID = %q, want %q", resumedID, sessionID)
+	}
+	if secondOutput.String() != "blue\n" {
+		t.Errorf("resumed output = %q, want %q", secondOutput.String(), "blue\\n")
 	}
 }
 

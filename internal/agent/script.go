@@ -2,9 +2,11 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
 	"sync"
 
 	sdk "github.com/coder/acp-go-sdk"
@@ -13,13 +15,23 @@ import (
 // Turn scripts one prompt turn of a scripted fake agent: the events it
 // streams and how the turn ends.
 type Turn struct {
-	Events []Event
-	Stop   StopReason
+	WantPrompt  string
+	WantHistory []string
+	Started     chan<- struct{}
+	Continue    <-chan struct{}
+	Events      []Event
+	Stop        StopReason
 }
 
-// Script is a canned agent performance; each Prompt consumes one Turn.
+// Script is a canned Agent performance shared across connections. Sharing is
+// deliberate: it models an Agent's durable Session context across restarts.
 type Script struct {
 	Turns []Turn
+
+	mu       sync.Mutex
+	next     int
+	sessions int
+	history  map[string][]string
 }
 
 // ConnectScript wires a scripted fake agent — built on the SDK's agent
@@ -28,18 +40,23 @@ type Script struct {
 // Conn exercise the production path end to end. This is the agent-edge
 // test seam from the v1 spec; it lives here so test packages never
 // import the ACP SDK themselves.
-func ConnectScript(ctx context.Context, logger *slog.Logger, onEvent EventHandler, script Script) (*Conn, error) {
+func ConnectScript(ctx context.Context, logger *slog.Logger, onEvent EventHandler, script *Script) (*Conn, error) {
+	if script == nil {
+		return nil, fmt.Errorf("script is required")
+	}
 	clientToAgentR, clientToAgentW := io.Pipe()
 	agentToClientR, agentToClientW := io.Pipe()
 
-	fake := &scriptedAgent{script: script}
+	fake := &scriptedAgent{
+		script:   script,
+		attached: make(map[string]bool),
+		active:   make(map[string]chan struct{}),
+	}
 	fake.conn = sdk.NewAgentSideConnection(fake, agentToClientW, clientToAgentR)
 	fake.conn.SetLogger(logger)
 
 	shutdown := func() error {
-		_ = clientToAgentW.Close()
-		_ = agentToClientW.Close()
-		return nil
+		return errors.Join(clientToAgentW.Close(), agentToClientW.Close())
 	}
 	return connect(ctx, logger, onEvent, clientToAgentW, agentToClientR, shutdown)
 }
@@ -54,11 +71,12 @@ type EventLog struct {
 }
 
 // Record implements EventHandler.
-func (l *EventLog) Record(sessionID string, ev Event) {
+func (l *EventLog) Record(_ context.Context, sessionID string, ev Event) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.sessions = append(l.sessions, sessionID)
 	l.events = append(l.events, ev)
+	return nil
 }
 
 // Snapshot returns copies of the recorded session ids and events, in
@@ -74,35 +92,96 @@ type scriptedAgent struct {
 	conn *sdk.AgentSideConnection
 
 	mu       sync.Mutex
-	script   Script
-	next     int
-	sessions int
+	script   *Script
+	attached map[string]bool
+	active   map[string]chan struct{}
 }
 
 var _ sdk.Agent = (*scriptedAgent)(nil)
 
 func (a *scriptedAgent) Initialize(ctx context.Context, p sdk.InitializeRequest) (sdk.InitializeResponse, error) {
-	return sdk.InitializeResponse{ProtocolVersion: sdk.ProtocolVersionNumber}, nil
+	return sdk.InitializeResponse{
+		ProtocolVersion: sdk.ProtocolVersionNumber,
+		AgentCapabilities: sdk.AgentCapabilities{
+			SessionCapabilities: sdk.SessionCapabilities{Resume: &sdk.SessionResumeCapabilities{}},
+		},
+	}, nil
 }
 
 func (a *scriptedAgent) NewSession(ctx context.Context, p sdk.NewSessionRequest) (sdk.NewSessionResponse, error) {
+	a.script.mu.Lock()
+	a.script.sessions++
+	id := fmt.Sprintf("scripted-session-%d", a.script.sessions)
+	if a.script.history == nil {
+		a.script.history = make(map[string][]string)
+	}
+	a.script.history[id] = nil
+	a.script.mu.Unlock()
+
 	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.sessions++
-	id := fmt.Sprintf("scripted-session-%d", a.sessions)
+	a.attached[id] = true
+	a.mu.Unlock()
 	return sdk.NewSessionResponse{SessionId: sdk.SessionId(id)}, nil
 }
 
 func (a *scriptedAgent) Prompt(ctx context.Context, p sdk.PromptRequest) (sdk.PromptResponse, error) {
+	sessionID := string(p.SessionId)
 	a.mu.Lock()
-	if a.next >= len(a.script.Turns) {
-		prompt := a.next + 1
-		a.mu.Unlock()
+	attached := a.attached[sessionID]
+	a.mu.Unlock()
+	if !attached {
+		return sdk.PromptResponse{}, fmt.Errorf("scripted agent: session %q is not attached", sessionID)
+	}
+
+	text := promptText(p.Prompt)
+	a.script.mu.Lock()
+	if a.script.next >= len(a.script.Turns) {
+		prompt := a.script.next + 1
+		a.script.mu.Unlock()
 		return sdk.PromptResponse{}, fmt.Errorf("scripted agent: no turn scripted for prompt %d", prompt)
 	}
-	turn := a.script.Turns[a.next]
-	a.next++
+	turn := a.script.Turns[a.script.next]
+	a.script.next++
+	a.script.history[sessionID] = append(a.script.history[sessionID], text)
+	history := append([]string(nil), a.script.history[sessionID]...)
+	a.script.mu.Unlock()
+
+	if turn.WantPrompt != "" && text != turn.WantPrompt {
+		return sdk.PromptResponse{}, fmt.Errorf("scripted agent: Prompt = %q, want %q", text, turn.WantPrompt)
+	}
+	if turn.WantHistory != nil && !slices.Equal(history, turn.WantHistory) {
+		return sdk.PromptResponse{}, fmt.Errorf("scripted agent: history = %q, want %q", history, turn.WantHistory)
+	}
+
+	cancelled := make(chan struct{})
+	a.mu.Lock()
+	a.active[sessionID] = cancelled
 	a.mu.Unlock()
+	defer func() {
+		a.mu.Lock()
+		if a.active[sessionID] == cancelled {
+			delete(a.active, sessionID)
+		}
+		a.mu.Unlock()
+	}()
+	if turn.Started != nil {
+		select {
+		case turn.Started <- struct{}{}:
+		case <-ctx.Done():
+			return sdk.PromptResponse{}, ctx.Err()
+		case <-cancelled:
+			return sdk.PromptResponse{}, context.Canceled
+		}
+	}
+	if turn.Continue != nil {
+		select {
+		case <-turn.Continue:
+		case <-ctx.Done():
+			return sdk.PromptResponse{}, ctx.Err()
+		case <-cancelled:
+			return sdk.PromptResponse{}, context.Canceled
+		}
+	}
 
 	for _, ev := range turn.Events {
 		if err := a.conn.SessionUpdate(ctx, sdk.SessionNotification{
@@ -113,6 +192,14 @@ func (a *scriptedAgent) Prompt(ctx context.Context, p sdk.PromptRequest) (sdk.Pr
 		}
 	}
 	return sdk.PromptResponse{StopReason: sdk.StopReason(turn.Stop)}, nil
+}
+
+func promptText(blocks []sdk.ContentBlock) string {
+	var text string
+	for _, block := range blocks {
+		text += contentText(block)
+	}
+	return text
 }
 
 // untranslate is the inverse of translate: it lets the scripted fake
@@ -154,6 +241,16 @@ func (a *scriptedAgent) Logout(ctx context.Context, p sdk.LogoutRequest) (sdk.Lo
 }
 
 func (a *scriptedAgent) Cancel(ctx context.Context, p sdk.CancelNotification) error {
+	id := string(p.SessionId)
+	a.mu.Lock()
+	cancelled := a.active[id]
+	if cancelled != nil {
+		delete(a.active, id)
+	}
+	a.mu.Unlock()
+	if cancelled != nil {
+		close(cancelled)
+	}
 	return nil
 }
 
@@ -166,7 +263,17 @@ func (a *scriptedAgent) ListSessions(ctx context.Context, p sdk.ListSessionsRequ
 }
 
 func (a *scriptedAgent) ResumeSession(ctx context.Context, p sdk.ResumeSessionRequest) (sdk.ResumeSessionResponse, error) {
-	return sdk.ResumeSessionResponse{}, sdk.NewMethodNotFound(sdk.AgentMethodSessionResume)
+	id := string(p.SessionId)
+	a.script.mu.Lock()
+	_, exists := a.script.history[id]
+	a.script.mu.Unlock()
+	if !exists {
+		return sdk.ResumeSessionResponse{}, fmt.Errorf("scripted agent: session %q does not exist", id)
+	}
+	a.mu.Lock()
+	a.attached[id] = true
+	a.mu.Unlock()
+	return sdk.ResumeSessionResponse{}, nil
 }
 
 func (a *scriptedAgent) SetSessionConfigOption(ctx context.Context, p sdk.SetSessionConfigOptionRequest) (sdk.SetSessionConfigOptionResponse, error) {

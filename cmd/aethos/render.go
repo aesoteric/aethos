@@ -1,10 +1,12 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 
 	"github.com/aesoteric/aethos/internal/agent"
+	"github.com/aesoteric/aethos/internal/channel"
 )
 
 const (
@@ -21,26 +23,44 @@ type renderer struct {
 	mode string
 }
 
-func (r *renderer) render(sessionID string, ev agent.Event) {
+// Send implements channel.Channel.
+func (r *renderer) Send(ctx context.Context, event channel.Event) error {
+	return r.render(ctx, event.SessionID, event.AgentEvent)
+}
+
+func (r *renderer) render(_ context.Context, _ string, ev agent.Event) error {
 	switch e := ev.(type) {
 	case agent.Thought:
 		if r.mode != modeThought {
-			r.breakLine()
-			fmt.Fprint(r.w, "[thinking] ")
+			if err := r.breakLine(); err != nil {
+				return err
+			}
+			if _, err := fmt.Fprint(r.w, "[thinking] "); err != nil {
+				return err
+			}
 			r.mode = modeThought
 		}
-		fmt.Fprint(r.w, e.Text)
+		_, err := fmt.Fprint(r.w, e.Text)
+		return err
 	case agent.Message:
 		if r.mode != modeMessage {
-			r.breakLine()
+			if err := r.breakLine(); err != nil {
+				return err
+			}
 			r.mode = modeMessage
 		}
-		fmt.Fprint(r.w, e.Text)
+		_, err := fmt.Fprint(r.w, e.Text)
+		return err
 	case agent.ToolCallBegan:
-		r.breakLine()
-		fmt.Fprintf(r.w, "[tool] %s%s\n", e.Title, toolMeta(e.Kind, e.Status))
+		if err := r.breakLine(); err != nil {
+			return err
+		}
+		_, err := fmt.Fprintf(r.w, "[tool] %s%s\n", e.Title, toolMeta(e.Kind, e.Status))
+		return err
 	case agent.ToolCallProgressed:
-		r.breakLine()
+		if err := r.breakLine(); err != nil {
+			return err
+		}
 		line := "[tool] " + e.ID
 		if e.Status != "" {
 			line += " → " + e.Status
@@ -48,21 +68,26 @@ func (r *renderer) render(sessionID string, ev agent.Event) {
 		if e.Title != "" {
 			line += " (" + e.Title + ")"
 		}
-		fmt.Fprintln(r.w, line)
+		_, err := fmt.Fprintln(r.w, line)
+		return err
 	}
+	return nil
 }
 
 // finish closes any text still streaming so the shell prompt lands on a
 // fresh line.
-func (r *renderer) finish() {
-	r.breakLine()
+func (r *renderer) finish() error {
+	return r.breakLine()
 }
 
-func (r *renderer) breakLine() {
+func (r *renderer) breakLine() error {
 	if r.mode != modeNone {
-		fmt.Fprintln(r.w)
+		if _, err := fmt.Fprintln(r.w); err != nil {
+			return err
+		}
 		r.mode = modeNone
 	}
+	return nil
 }
 
 func toolMeta(kind, status string) string {

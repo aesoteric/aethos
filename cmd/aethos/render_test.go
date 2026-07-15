@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -50,12 +52,28 @@ func TestRendererStreamsEventsReadably(t *testing.T) {
 			var out strings.Builder
 			r := &renderer{w: &out}
 			for _, ev := range tt.events {
-				r.render("session-1", ev)
+				if err := r.render(context.Background(), "session-1", ev); err != nil {
+					t.Fatalf("render: %v", err)
+				}
 			}
-			r.finish()
+			if err := r.finish(); err != nil {
+				t.Fatalf("finish: %v", err)
+			}
 			if out.String() != tt.want {
 				t.Errorf("rendered output:\n%q\nwant:\n%q", out.String(), tt.want)
 			}
 		})
 	}
 }
+
+func TestRendererReportsWriteFailure(t *testing.T) {
+	want := errors.New("write failed")
+	r := &renderer{w: errorWriter{err: want}}
+	if err := r.render(context.Background(), "session-1", agent.Message{Text: "hello"}); !errors.Is(err, want) {
+		t.Errorf("render error = %v, want %v", err, want)
+	}
+}
+
+type errorWriter struct{ err error }
+
+func (w errorWriter) Write([]byte) (int, error) { return 0, w.err }

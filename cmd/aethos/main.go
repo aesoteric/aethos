@@ -122,44 +122,88 @@ func run(
 // installed ACP agent, open a Session, dispatch one Prompt, and stream
 // the agent's output to stdout as it happens.
 func devPrompt(ctx context.Context, logger *slog.Logger, args []string, stdout, stderr io.Writer) error {
+	_, err := devPromptWithConnector(ctx, logger, args, stdout, stderr, agentConnector(logger))
+	return err
+}
+
+func devPromptWithConnector(
+	ctx context.Context,
+	logger *slog.Logger,
+	args []string,
+	stdout, stderr io.Writer,
+	connect session.Connect,
+) (sessionID string, returnErr error) {
 	fs := flag.NewFlagSet("dev prompt", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	agentCmd := fs.String("agent", "", `agent command to spawn, e.g. "npx @zed-industries/claude-code-acp"`)
 	workspace := fs.String("workspace", ".", "Workspace directory for the Session")
+	dataDirFlag := fs.String("data-dir", "", "directory containing the durable Session database")
+	resumeID := fs.String("session", "", "existing Session to resume")
 	if err := fs.Parse(args); err != nil {
-		return errUsage
+		return "", errUsage
 	}
 
 	text := strings.TrimSpace(strings.Join(fs.Args(), " "))
-	argv := strings.Fields(*agentCmd)
-	if len(argv) == 0 || text == "" {
-		fmt.Fprintln(stderr, `usage: aethos dev prompt -agent <command> [-workspace <dir>] <prompt text>`)
-		return errUsage
+	if text == "" || (*resumeID == "" && len(strings.Fields(*agentCmd)) == 0) {
+		fmt.Fprintln(stderr, `usage: aethos dev prompt [-data-dir <dir>] (-agent <command> [-workspace <dir>] | -session <id>) <prompt text>`)
+		return "", errUsage
 	}
 
-	ws, err := filepath.Abs(*workspace)
+	dataDir, err := config.ResolveDataDir(*dataDirFlag)
 	if err != nil {
-		return fmt.Errorf("resolve workspace: %w", err)
+		return "", err
+	}
+	paths, err := config.NewPaths(dataDir)
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(paths.DataDir, 0o700); err != nil {
+		return "", fmt.Errorf("create data directory %q: %w", paths.DataDir, err)
 	}
 
 	r := &renderer{w: stdout}
-	conn, err := agent.Spawn(ctx, logger, r.render, argv[0], argv[1:]...)
+	manager, err := session.Open(ctx, paths.DatabaseFile, connect, r)
 	if err != nil {
-		return err
+		return "", err
 	}
-	defer conn.Close()
+	defer func() { returnErr = errors.Join(returnErr, manager.Close()) }()
 
-	sess, err := session.New(ctx, conn, ws)
-	if err != nil {
-		return err
+	var record session.Record
+	if *resumeID != "" {
+		record, err = manager.Get(ctx, *resumeID)
+	} else {
+		ws, resolveErr := filepath.Abs(*workspace)
+		if resolveErr != nil {
+			return "", fmt.Errorf("resolve workspace: %w", resolveErr)
+		}
+		record, err = manager.Create(ctx, session.Create{
+			Agent:     *agentCmd,
+			Workspace: ws,
+			Owner:     session.Owner{Channel: "dev", ID: "local"},
+		})
 	}
-	logger.Info("session opened", "session", sess.ID(), "workspace", ws, "agent", *agentCmd)
+	if err != nil {
+		return "", err
+	}
+	logger.Info("session opened", "session", record.ID, "workspace", record.Workspace, "agent", record.Agent)
 
-	stop, err := sess.Prompt(ctx, text)
+	stop, err := manager.Prompt(ctx, record.ID, text)
 	if err != nil {
-		return err
+		return "", err
 	}
-	r.finish()
-	logger.Info("turn ended", "session", sess.ID(), "stop", string(stop))
-	return nil
+	if err := r.finish(); err != nil {
+		return "", fmt.Errorf("finish Agent output: %w", err)
+	}
+	logger.Info("turn ended", "session", record.ID, "stop", string(stop))
+	return record.ID, nil
+}
+
+func agentConnector(logger *slog.Logger) session.Connect {
+	return func(ctx context.Context, command string, onEvent agent.EventHandler) (*agent.Conn, error) {
+		args := strings.Fields(command)
+		if len(args) == 0 {
+			return nil, fmt.Errorf("agent command is empty")
+		}
+		return agent.Spawn(ctx, logger, onEvent, args[0], args[1:]...)
+	}
 }
