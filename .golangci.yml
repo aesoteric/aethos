@@ -1,0 +1,10 @@
+version: "2"
+
+linters:
+  # The standard set: errcheck, govet, ineffassign, staticcheck, unused.
+  # errcheck backs the spec's "no silently swallowed errors" contract.
+  default: standard
+  exclusions:
+    presets:
+      - std-error-handling
+      - common-false-positives

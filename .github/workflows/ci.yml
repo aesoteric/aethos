@@ -18,6 +18,17 @@ jobs:
       - name: Test
         run: go test -race ./...
 
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.12.2
+
   # The product ships as cgo-free static binaries for four platforms;
   # cross-compiling all of them keeps that guarantee from regressing.
   cross-compile:
