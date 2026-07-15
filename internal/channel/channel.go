@@ -32,6 +32,18 @@ type PromptTarget interface {
 	Prompt(context.Context, string, string) (agent.StopReason, error)
 }
 
+// PermissionResponse is an inbound Channel answer to a pending permission
+// request.
+type PermissionResponse struct {
+	RequestID string
+	OptionID  string
+}
+
+// PermissionTarget accepts answers to pending permission requests.
+type PermissionTarget interface {
+	ResolvePermission(context.Context, string, string) error
+}
+
 // Memory is an in-memory Channel for flow tests.
 type Memory struct {
 	mu     sync.Mutex
@@ -49,6 +61,12 @@ func (m *Memory) Send(_ context.Context, event Event) error {
 // Inject delivers an inbound Prompt through the human-edge seam.
 func (m *Memory) Inject(ctx context.Context, target PromptTarget, prompt Prompt) (agent.StopReason, error) {
 	return target.Prompt(ctx, prompt.SessionID, prompt.Text)
+}
+
+// InjectPermission resolves a pending permission request through the human-edge
+// seam.
+func (m *Memory) InjectPermission(ctx context.Context, target PermissionTarget, response PermissionResponse) error {
+	return target.ResolvePermission(ctx, response.RequestID, response.OptionID)
 }
 
 // Snapshot returns a copy of every recorded event in delivery order.

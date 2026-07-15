@@ -63,7 +63,7 @@ func TestWizardRepromptsForRejectedTokenAndWritesCommentedConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read generated config: %v", err)
 	}
-	for _, comment := range []string{"# Workspace", "# Agent", "# Telegram", "AETHOS_TELEGRAM_BOT_TOKEN"} {
+	for _, comment := range []string{"# Workspace", "# Agent", "# permissions", "# Telegram", "AETHOS_TELEGRAM_BOT_TOKEN"} {
 		if !strings.Contains(string(written), comment) {
 			t.Errorf("generated config does not contain explanatory comment %q:\n%s", comment, written)
 		}

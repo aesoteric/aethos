@@ -23,7 +23,7 @@ func TestPromptStreamsScriptedEventsInOrder(t *testing.T) {
 	script := agent.Script{Turns: []agent.Turn{{Events: scripted, Stop: agent.StopEndTurn}}}
 
 	log := &agent.EventLog{}
-	conn, err := agent.ConnectScript(t.Context(), discardLogger(), log.Record, &script)
+	conn, err := agent.ConnectScript(t.Context(), discardLogger(), agent.Handlers{Event: log.Record}, &script)
 	if err != nil {
 		t.Fatalf("ConnectScript: %v", err)
 	}
@@ -63,7 +63,7 @@ func TestEachPromptConsumesOneScriptedTurn(t *testing.T) {
 	}}
 
 	log := &agent.EventLog{}
-	conn, err := agent.ConnectScript(t.Context(), discardLogger(), log.Record, &script)
+	conn, err := agent.ConnectScript(t.Context(), discardLogger(), agent.Handlers{Event: log.Record}, &script)
 	if err != nil {
 		t.Fatalf("ConnectScript: %v", err)
 	}

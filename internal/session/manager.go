@@ -16,6 +16,7 @@ import (
 
 	"github.com/aesoteric/aethos/internal/agent"
 	"github.com/aesoteric/aethos/internal/channel"
+	"github.com/aesoteric/aethos/internal/permission"
 )
 
 // State is the persisted lifecycle state of a Session.
@@ -73,13 +74,15 @@ type Record struct {
 // Connect starts one configured Agent and attaches an event handler to it.
 // Production supplies a subprocess connector; flow tests supply the scripted
 // ACP Agent connector.
-type Connect func(context.Context, string, agent.EventHandler) (*agent.Conn, error)
+type Connect func(context.Context, string, agent.Handlers) (*agent.Conn, error)
 
 // Option configures Session lifecycle behavior when a Manager opens.
 type Option func(*openOptions) error
 
 type openOptions struct {
-	idleTimeout time.Duration
+	idleTimeout       time.Duration
+	permissionTimeout time.Duration
+	autoApprove       []string
 }
 
 // WithIdleTimeout demotes live Sessions after they have had no Prompt work for
@@ -90,6 +93,27 @@ func WithIdleTimeout(timeout time.Duration) Option {
 			return fmt.Errorf("idle timeout cannot be negative")
 		}
 		options.idleTimeout = timeout
+		return nil
+	}
+}
+
+// WithPermissionTimeout sets the fail-safe deadline for unanswered Agent
+// permission requests.
+func WithPermissionTimeout(timeout time.Duration) Option {
+	return func(options *openOptions) error {
+		if timeout <= 0 {
+			return fmt.Errorf("permission timeout must be greater than zero")
+		}
+		options.permissionTimeout = timeout
+		return nil
+	}
+}
+
+// WithAutoApprove permits the listed exact Agent tool kinds without surfacing
+// a request to the Channel.
+func WithAutoApprove(kinds ...string) Option {
+	return func(options *openOptions) error {
+		options.autoApprove = append([]string(nil), kinds...)
 		return nil
 	}
 }
@@ -120,6 +144,7 @@ type Manager struct {
 	cancel  context.CancelFunc
 
 	idleTimeout time.Duration
+	permissions *permission.Gate
 
 	mu            sync.Mutex
 	sessions      map[string]*managedSession
@@ -166,7 +191,7 @@ func Open(ctx context.Context, databasePath string, connect Connect, ch channel.
 	if ch == nil {
 		return nil, fmt.Errorf("channel is required")
 	}
-	var options openOptions
+	options := openOptions{permissionTimeout: permission.DefaultTimeout}
 	for _, configure := range option {
 		if configure == nil {
 			return nil, fmt.Errorf("session option is required")
@@ -180,21 +205,34 @@ func Open(ctx context.Context, databasePath string, connect Connect, ch channel.
 	if err != nil {
 		return nil, err
 	}
+	var manager *Manager
+	gate, err := permission.New(
+		options.permissionTimeout,
+		options.autoApprove,
+		func(eventCtx context.Context, sessionID string, request agent.PermissionRequested) error {
+			return ch.Send(eventCtx, channel.Event{SessionID: sessionID, AgentEvent: request})
+		},
+		func(err error) { manager.recordBackgroundError(err) },
+	)
+	if err != nil {
+		return nil, errors.Join(err, closeDatabase(db))
+	}
 	lifecycle, cancel := context.WithCancel(context.Background())
-	m := &Manager{
+	manager = &Manager{
 		db:          db,
 		connect:     connect,
 		channel:     ch,
 		ctx:         lifecycle,
 		cancel:      cancel,
 		idleTimeout: options.idleTimeout,
+		permissions: gate,
 		sessions:    make(map[string]*managedSession),
 	}
-	if err := m.load(ctx); err != nil {
+	if err := manager.load(ctx); err != nil {
 		cancel()
 		return nil, errors.Join(err, closeDatabase(db))
 	}
-	return m, nil
+	return manager, nil
 }
 
 // Create starts an Agent Session and persists its ownership and lifecycle
@@ -215,8 +253,11 @@ func (m *Manager) Create(ctx context.Context, create Create) (Record, error) {
 	if err != nil {
 		return Record{}, fmt.Errorf("create Session identity: %w", err)
 	}
-	conn, err := m.connect(ctx, create.Agent, func(eventCtx context.Context, _ string, event agent.Event) error {
-		return m.channel.Send(eventCtx, channel.Event{SessionID: id, AgentEvent: event})
+	conn, err := m.connect(ctx, create.Agent, agent.Handlers{
+		Event: func(eventCtx context.Context, _ string, event agent.Event) error {
+			return m.channel.Send(eventCtx, channel.Event{SessionID: id, AgentEvent: event})
+		},
+		Permission: m.permissionHandler(id),
 	})
 	if err != nil {
 		return Record{}, fmt.Errorf("connect Agent %q: %w", create.Agent, err)
@@ -370,6 +411,27 @@ func (m *Manager) Cancel(ctx context.Context, id string) error {
 	}
 }
 
+// ResolvePermission answers one pending Agent permission request. Repeating a
+// completed answer is idempotent.
+func (m *Manager) ResolvePermission(ctx context.Context, requestID, optionID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return m.permissions.Resolve(requestID, optionID)
+}
+
+func (m *Manager) permissionHandler(id string) agent.PermissionHandler {
+	return func(permissionCtx context.Context, _ string, request agent.PermissionRequest) (agent.PermissionDecision, error) {
+		return m.permissions.Request(permissionCtx, id, request)
+	}
+}
+
+func (m *Manager) recordBackgroundError(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.backgroundErr = errors.Join(m.backgroundErr, err)
+}
+
 func (m *Manager) runPrompt(ctx context.Context, id string, managed *managedSession, call *promptCall) (agent.StopReason, error) {
 	turnCtx, cancel := context.WithCancel(ctx)
 	stopLifecycleCancel := context.AfterFunc(m.ctx, cancel)
@@ -435,11 +497,14 @@ func (m *Manager) liveConnection(ctx context.Context, id string, managed *manage
 
 	var resuming atomic.Bool
 	resuming.Store(true)
-	conn, err := m.connect(ctx, managed.record.Agent, func(eventCtx context.Context, _ string, event agent.Event) error {
-		if resuming.Load() {
-			return nil
-		}
-		return m.channel.Send(eventCtx, channel.Event{SessionID: id, AgentEvent: event})
+	conn, err := m.connect(ctx, managed.record.Agent, agent.Handlers{
+		Event: func(eventCtx context.Context, _ string, event agent.Event) error {
+			if resuming.Load() {
+				return nil
+			}
+			return m.channel.Send(eventCtx, channel.Event{SessionID: id, AgentEvent: event})
+		},
+		Permission: m.permissionHandler(id),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("connect Agent %q: %w", managed.record.Agent, err)

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/aesoteric/aethos/internal/permission"
 )
 
 // DefaultIdleTimeout bounds how long an Agent subprocess remains attached
@@ -25,7 +26,7 @@ type Duration time.Duration
 func (duration *Duration) UnmarshalText(text []byte) error {
 	parsed, err := time.ParseDuration(string(text))
 	if err != nil {
-		return fmt.Errorf("idle_timeout must be a duration such as 30m: %w", err)
+		return fmt.Errorf("must be a duration such as 30m: %w", err)
 	}
 	*duration = Duration(parsed)
 	return nil
@@ -56,12 +57,20 @@ type Telegram struct {
 	BotToken string `toml:"bot_token"`
 }
 
+// Permissions configures the fail-safe deadline and exact Agent tool kinds
+// that the permission gate may approve without Channel interaction.
+type Permissions struct {
+	Timeout     Duration `toml:"timeout"`
+	AutoApprove []string `toml:"auto_approve"`
+}
+
 // Config is the complete startup configuration.
 type Config struct {
-	Workspace    string   `toml:"workspace"`
-	DefaultAgent string   `toml:"default_agent"`
-	IdleTimeout  Duration `toml:"idle_timeout"`
-	Telegram     Telegram `toml:"telegram"`
+	Workspace    string      `toml:"workspace"`
+	DefaultAgent string      `toml:"default_agent"`
+	IdleTimeout  Duration    `toml:"idle_timeout"`
+	Permissions  Permissions `toml:"permissions"`
+	Telegram     Telegram    `toml:"telegram"`
 }
 
 // ResolveDataDir selects the data directory. An explicit flag wins over
@@ -106,7 +115,7 @@ func absolutePath(name, path string) (string, error) {
 
 // Load reads, overlays, and validates a TOML configuration file.
 func Load(path string) (Config, error) {
-	cfg := Config{IdleTimeout: Duration(DefaultIdleTimeout)}
+	cfg := defaultConfig()
 	metadata, err := toml.DecodeFile(path, &cfg)
 	if err != nil {
 		return Config{}, fmt.Errorf("parse config %q: %w", path, err)
@@ -124,6 +133,13 @@ func Load(path string) (Config, error) {
 		return Config{}, fmt.Errorf("invalid config %q: %w", path, err)
 	}
 	return cfg, nil
+}
+
+func defaultConfig() Config {
+	return Config{
+		IdleTimeout: Duration(DefaultIdleTimeout),
+		Permissions: Permissions{Timeout: Duration(permission.DefaultTimeout)},
+	}
 }
 
 func applyEnvironment(cfg *Config) {
@@ -154,6 +170,19 @@ func (c Config) Validate() error {
 	}
 	if c.IdleTimeout <= 0 {
 		return fmt.Errorf("idle_timeout must be greater than zero")
+	}
+	if c.Permissions.Timeout <= 0 {
+		return fmt.Errorf("permissions.timeout must be greater than zero")
+	}
+	seenKinds := make(map[string]struct{}, len(c.Permissions.AutoApprove))
+	for _, kind := range c.Permissions.AutoApprove {
+		if strings.TrimSpace(kind) == "" {
+			return fmt.Errorf("permissions.auto_approve cannot contain an empty tool kind")
+		}
+		if _, duplicate := seenKinds[kind]; duplicate {
+			return fmt.Errorf("permissions.auto_approve contains duplicate tool kind %q", kind)
+		}
+		seenKinds[kind] = struct{}{}
 	}
 	return nil
 }

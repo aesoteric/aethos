@@ -49,12 +49,10 @@ func RunWizard(
 		return Config{}, err
 	}
 
-	effective := Config{
-		Workspace:    workspace,
-		DefaultAgent: defaultAgent,
-		IdleTimeout:  Duration(DefaultIdleTimeout),
-		Telegram:     Telegram{BotToken: token},
-	}
+	effective := defaultConfig()
+	effective.Workspace = workspace
+	effective.DefaultAgent = defaultAgent
+	effective.Telegram.BotToken = token
 	if err := effective.Validate(); err != nil {
 		return Config{}, fmt.Errorf("validate setup: %w", err)
 	}
@@ -200,6 +198,9 @@ func writeCommentedConfig(paths Paths, cfg Config) error {
 # Agent is the command used to start the default ACP-compatible Agent.
 # idle_timeout releases an Agent subprocess while keeping its Session record;
 # the next Prompt resumes it automatically.
+# permissions.timeout denies unanswered risky actions after the deadline.
+# permissions.auto_approve lists exact Agent tool kinds, such as "read", that
+# are allowed without asking; leave it empty to ask every time.
 # Telegram bot_token authenticates the Telegram Channel. For containers and
 # other secret-managed deployments, leave it empty and set
 # AETHOS_TELEGRAM_BOT_TOKEN instead. AETHOS_WORKSPACE and

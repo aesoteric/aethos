@@ -3,6 +3,7 @@ package config_test
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -113,10 +114,51 @@ func TestLoadDefaultsAndValidatesIdleTimeout(t *testing.T) {
 	if time.Duration(got.IdleTimeout) != config.DefaultIdleTimeout {
 		t.Errorf("IdleTimeout = %s, want default %s", time.Duration(got.IdleTimeout), config.DefaultIdleTimeout)
 	}
+	if time.Duration(got.Permissions.Timeout) != 10*time.Minute {
+		t.Errorf("Permissions.Timeout = %s, want default 10m", time.Duration(got.Permissions.Timeout))
+	}
 
 	writeFixture(t, path, "idle_timeout = \"never\"\n[telegram]\nbot_token = \"\"\n")
 	if _, err := config.Load(path); err == nil || !strings.Contains(err.Error(), "idle_timeout") {
 		t.Errorf("Load invalid idle timeout error = %v, want actionable idle_timeout error", err)
+	}
+}
+
+func TestLoadReadsAndValidatesPermissionPolicy(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	writeFixture(t, path, `workspace = "/workspace"
+default_agent = "codex-acp"
+
+[permissions]
+timeout = "45s"
+auto_approve = ["read", "search"]
+
+[telegram]
+bot_token = "token"
+`)
+
+	got, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load permission policy: %v", err)
+	}
+	if time.Duration(got.Permissions.Timeout) != 45*time.Second {
+		t.Errorf("Permissions.Timeout = %s, want 45s", time.Duration(got.Permissions.Timeout))
+	}
+	if want := []string{"read", "search"}; !slices.Equal(got.Permissions.AutoApprove, want) {
+		t.Errorf("Permissions.AutoApprove = %q, want %q", got.Permissions.AutoApprove, want)
+	}
+
+	writeFixture(t, path, `workspace = "/workspace"
+default_agent = "codex-acp"
+
+[permissions]
+timeout = "0s"
+
+[telegram]
+bot_token = "token"
+`)
+	if _, err := config.Load(path); err == nil || !strings.Contains(err.Error(), "permissions.timeout") {
+		t.Errorf("Load invalid permission timeout error = %v, want actionable permissions.timeout error", err)
 	}
 }
 

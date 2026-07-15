@@ -45,6 +45,20 @@ and log paths are all rooted there. Environment values override the file:
 defaults to 30 minutes and controls how long a live Session with no Prompt work
 keeps its Agent subprocess attached.
 
+The permission gate denies unanswered requests after 10 minutes by default.
+Exact Agent-reported tool kinds can be auto-approved in `config.toml`; an empty
+list is the safest default and asks the Channel every time:
+
+```toml
+[permissions]
+timeout = "10m"
+auto_approve = ["read", "search"]
+```
+
+Auto-approved requests select a one-time allow option when the Agent offers one.
+File edits, shell commands, and any tool kind not listed still pause the Prompt
+for a Channel response.
+
 Invalid TOML, unknown fields, and missing required values stop startup with an
 actionable error.
 

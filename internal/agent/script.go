@@ -19,9 +19,18 @@ type Turn struct {
 	WantHistory []string
 	Started     chan<- struct{}
 	Continue    <-chan struct{}
+	Permissions []ScriptedPermission
 	Events      []Event
 	Stop        StopReason
 	Crash       bool
+}
+
+// ScriptedPermission asks the real ACP client for permission during a scripted
+// turn and verifies the response observed by the fake Agent.
+type ScriptedPermission struct {
+	Request       PermissionRequest
+	WantOptionID  string
+	WantCancelled bool
 }
 
 // Script is a canned Agent performance shared across connections. Sharing is
@@ -44,7 +53,12 @@ type Script struct {
 // Conn exercise the production path end to end. This is the agent-edge
 // test seam from the v1 spec; it lives here so test packages never
 // import the ACP SDK themselves.
-func ConnectScript(ctx context.Context, logger *slog.Logger, onEvent EventHandler, script *Script) (*Conn, error) {
+func ConnectScript(
+	ctx context.Context,
+	logger *slog.Logger,
+	handlers Handlers,
+	script *Script,
+) (*Conn, error) {
 	if script == nil {
 		return nil, fmt.Errorf("script is required")
 	}
@@ -85,7 +99,7 @@ func ConnectScript(ctx context.Context, logger *slog.Logger, onEvent EventHandle
 		lifecycle.finish(nil)
 		return err
 	}
-	return connect(ctx, logger, onEvent, clientToAgentW, agentToClientR, shutdown, lifecycle)
+	return connect(ctx, logger, handlers, clientToAgentW, agentToClientR, shutdown, lifecycle)
 }
 
 // EventLog is a race-safe event collector for flow tests: pass Record as
@@ -215,6 +229,24 @@ func (a *scriptedAgent) Prompt(ctx context.Context, p sdk.PromptRequest) (sdk.Pr
 		a.crash(err)
 		return sdk.PromptResponse{}, err
 	}
+	for _, permission := range turn.Permissions {
+		response, err := a.conn.RequestPermission(ctx, scriptPermissionRequest(p.SessionId, permission.Request))
+		if err != nil {
+			return sdk.PromptResponse{}, fmt.Errorf("scripted Agent permission request: %w", err)
+		}
+		if permission.WantCancelled {
+			if response.Outcome.Cancelled == nil {
+				return sdk.PromptResponse{}, fmt.Errorf("scripted Agent permission outcome was selected, want cancelled")
+			}
+			continue
+		}
+		if response.Outcome.Selected == nil {
+			return sdk.PromptResponse{}, fmt.Errorf("scripted Agent permission outcome was cancelled, want option %q", permission.WantOptionID)
+		}
+		if got := string(response.Outcome.Selected.OptionId); got != permission.WantOptionID {
+			return sdk.PromptResponse{}, fmt.Errorf("scripted Agent permission option = %q, want %q", got, permission.WantOptionID)
+		}
+	}
 
 	for _, ev := range turn.Events {
 		if err := a.conn.SessionUpdate(ctx, sdk.SessionNotification{
@@ -225,6 +257,32 @@ func (a *scriptedAgent) Prompt(ctx context.Context, p sdk.PromptRequest) (sdk.Pr
 		}
 	}
 	return sdk.PromptResponse{StopReason: sdk.StopReason(turn.Stop)}, nil
+}
+
+func scriptPermissionRequest(sessionID sdk.SessionId, request PermissionRequest) sdk.RequestPermissionRequest {
+	toolCall := sdk.ToolCallUpdate{
+		ToolCallId: sdk.ToolCallId(request.ToolCallID),
+		RawInput:   request.Input,
+	}
+	if request.Title != "" {
+		toolCall.Title = sdk.Ptr(request.Title)
+	}
+	if request.Kind != "" {
+		toolCall.Kind = sdk.Ptr(sdk.ToolKind(request.Kind))
+	}
+	options := make([]sdk.PermissionOption, 0, len(request.Options))
+	for _, option := range request.Options {
+		options = append(options, sdk.PermissionOption{
+			OptionId: sdk.PermissionOptionId(option.ID),
+			Name:     option.Name,
+			Kind:     sdk.PermissionOptionKind(option.Kind),
+		})
+	}
+	return sdk.RequestPermissionRequest{
+		SessionId: sessionID,
+		ToolCall:  toolCall,
+		Options:   options,
+	}
 }
 
 func promptText(blocks []sdk.ContentBlock) string {

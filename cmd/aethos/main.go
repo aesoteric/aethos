@@ -161,22 +161,29 @@ func devPromptWithConnector(
 		return "", fmt.Errorf("create data directory %q: %w", paths.DataDir, err)
 	}
 	idleTimeout := config.DefaultIdleTimeout
+	var managerOptions []session.Option
 	configured, configErr := config.Load(paths.ConfigFile)
 	switch {
 	case configErr == nil:
 		idleTimeout = time.Duration(configured.IdleTimeout)
+		managerOptions = append(
+			managerOptions,
+			session.WithPermissionTimeout(time.Duration(configured.Permissions.Timeout)),
+			session.WithAutoApprove(configured.Permissions.AutoApprove...),
+		)
 	case errors.Is(configErr, os.ErrNotExist):
 	default:
 		return "", configErr
 	}
 
 	r := &renderer{w: stdout}
+	managerOptions = append(managerOptions, session.WithIdleTimeout(idleTimeout))
 	manager, err := session.Open(
 		ctx,
 		paths.DatabaseFile,
 		connect,
 		r,
-		session.WithIdleTimeout(idleTimeout),
+		managerOptions...,
 	)
 	if err != nil {
 		return "", err
@@ -214,11 +221,11 @@ func devPromptWithConnector(
 }
 
 func agentConnector(logger *slog.Logger) session.Connect {
-	return func(ctx context.Context, command string, onEvent agent.EventHandler) (*agent.Conn, error) {
+	return func(ctx context.Context, command string, handlers agent.Handlers) (*agent.Conn, error) {
 		args := strings.Fields(command)
 		if len(args) == 0 {
 			return nil, fmt.Errorf("agent command is empty")
 		}
-		return agent.Spawn(ctx, logger, onEvent, args[0], args[1:]...)
+		return agent.Spawn(ctx, logger, handlers, args[0], args[1:]...)
 	}
 }

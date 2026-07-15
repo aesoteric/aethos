@@ -19,7 +19,7 @@ type Conn struct {
 	sdk          *sdk.ClientSideConnection
 	capabilities sdk.AgentCapabilities
 	logger       *slog.Logger
-	onEvent      EventHandler
+	handlers     Handlers
 	shutdown     func() error
 	lifecycle    *connectionLifecycle
 	closeOnce    sync.Once
@@ -57,7 +57,13 @@ func (l *connectionLifecycle) exitError() error {
 // Spawn launches an ACP agent subprocess, connects over its stdio, and
 // performs the protocol handshake. The agent's stderr is forwarded to
 // the logger at debug level.
-func Spawn(ctx context.Context, logger *slog.Logger, onEvent EventHandler, name string, args ...string) (*Conn, error) {
+func Spawn(
+	ctx context.Context,
+	logger *slog.Logger,
+	handlers Handlers,
+	name string,
+	args ...string,
+) (*Conn, error) {
 	// Conn owns the subprocess lifetime. The caller's context bounds startup and
 	// protocol operations; Close is the single place that terminates the Agent.
 	cmd := exec.Command(name, args...)
@@ -87,7 +93,7 @@ func Spawn(ctx context.Context, logger *slog.Logger, onEvent EventHandler, name 
 		<-lifecycle.done
 		return nil
 	}
-	return connect(ctx, logger, onEvent, stdin, stdout, shutdown, lifecycle)
+	return connect(ctx, logger, handlers, stdin, stdout, shutdown, lifecycle)
 }
 
 // connect wires the client side of an ACP connection over the given
@@ -95,13 +101,13 @@ func Spawn(ctx context.Context, logger *slog.Logger, onEvent EventHandler, name 
 func connect(
 	ctx context.Context,
 	logger *slog.Logger,
-	onEvent EventHandler,
+	handlers Handlers,
 	peerIn io.Writer,
 	peerOut io.Reader,
 	shutdown func() error,
 	lifecycle *connectionLifecycle,
 ) (*Conn, error) {
-	c := &Conn{logger: logger, onEvent: onEvent, shutdown: shutdown, lifecycle: lifecycle}
+	c := &Conn{logger: logger, handlers: handlers, shutdown: shutdown, lifecycle: lifecycle}
 	c.sdk = sdk.NewClientSideConnection(&client{conn: c}, peerIn, peerOut)
 	c.sdk.SetLogger(logger)
 	initialized, err := c.sdk.Initialize(ctx, sdk.InitializeRequest{
@@ -243,28 +249,63 @@ var _ sdk.Client = (*client)(nil)
 func (cl *client) SessionUpdate(ctx context.Context, n sdk.SessionNotification) error {
 	if ev, ok := translate(n.Update); ok {
 		sessionID := string(n.SessionId)
-		if err := cl.conn.onEvent(ctx, sessionID, ev); err != nil {
+		if cl.conn.handlers.Event == nil {
+			return nil
+		}
+		if err := cl.conn.handlers.Event(ctx, sessionID, ev); err != nil {
 			cl.conn.recordEventError(sessionID, err)
 		}
 	}
 	return nil
 }
 
-// RequestPermission answers with a rejection: the permission gate is a
-// later Module, and until it exists the fail-safe default is denial.
 func (cl *client) RequestPermission(ctx context.Context, p sdk.RequestPermissionRequest) (sdk.RequestPermissionResponse, error) {
-	cl.conn.logger.Warn("denying permission request: no permission gate yet",
-		"session", p.SessionId, "tool", p.ToolCall.ToolCallId)
-	for _, opt := range p.Options {
-		if opt.Kind == sdk.PermissionOptionKindRejectOnce {
-			return sdk.RequestPermissionResponse{Outcome: sdk.RequestPermissionOutcome{
-				Selected: &sdk.RequestPermissionOutcomeSelected{OptionId: opt.OptionId},
-			}}, nil
+	request := translatePermissionRequest(p)
+	handler := cl.conn.handlers.Permission
+	if handler == nil {
+		handler = rejectPermission
+	}
+	response, err := handler(ctx, string(p.SessionId), request)
+	if err != nil {
+		return sdk.RequestPermissionResponse{}, err
+	}
+	if response.Cancelled || response.OptionID == "" {
+		return sdk.RequestPermissionResponse{Outcome: sdk.NewRequestPermissionOutcomeCancelled()}, nil
+	}
+	return sdk.RequestPermissionResponse{
+		Outcome: sdk.NewRequestPermissionOutcomeSelected(sdk.PermissionOptionId(response.OptionID)),
+	}, nil
+}
+
+func translatePermissionRequest(p sdk.RequestPermissionRequest) PermissionRequest {
+	request := PermissionRequest{
+		ToolCallID: string(p.ToolCall.ToolCallId),
+		Input:      p.ToolCall.RawInput,
+		Options:    make([]PermissionOption, 0, len(p.Options)),
+	}
+	if p.ToolCall.Title != nil {
+		request.Title = *p.ToolCall.Title
+	}
+	if p.ToolCall.Kind != nil {
+		request.Kind = string(*p.ToolCall.Kind)
+	}
+	for _, option := range p.Options {
+		request.Options = append(request.Options, PermissionOption{
+			ID:   string(option.OptionId),
+			Name: option.Name,
+			Kind: PermissionOptionKind(option.Kind),
+		})
+	}
+	return request
+}
+
+func rejectPermission(_ context.Context, _ string, request PermissionRequest) (PermissionDecision, error) {
+	for _, option := range request.Options {
+		if option.Kind == PermissionRejectOnce || option.Kind == PermissionRejectAlways {
+			return PermissionDecision{OptionID: option.ID}, nil
 		}
 	}
-	return sdk.RequestPermissionResponse{Outcome: sdk.RequestPermissionOutcome{
-		Cancelled: &sdk.RequestPermissionOutcomeCancelled{},
-	}}, nil
+	return PermissionDecision{Cancelled: true}, nil
 }
 
 // aethos advertises no fs or terminal capabilities, so a conforming

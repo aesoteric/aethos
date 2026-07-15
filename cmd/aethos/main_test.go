@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aesoteric/aethos/internal/agent"
 	"github.com/aesoteric/aethos/internal/telegram"
@@ -58,8 +59,8 @@ func TestDevPromptPersistsAndResumesSession(t *testing.T) {
 			Stop:        agent.StopEndTurn,
 		},
 	}}
-	connect := func(ctx context.Context, _ string, onEvent agent.EventHandler) (*agent.Conn, error) {
-		return agent.ConnectScript(ctx, slog.New(slog.DiscardHandler), onEvent, &script)
+	connect := func(ctx context.Context, _ string, handlers agent.Handlers) (*agent.Conn, error) {
+		return agent.ConnectScript(ctx, slog.New(slog.DiscardHandler), handlers, &script)
 	}
 	dataDir := t.TempDir()
 	workspace := t.TempDir()
@@ -120,7 +121,7 @@ bot_token = "token"
 	if err := os.WriteFile(configFile, []byte(contents), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
-	connect := func(context.Context, string, agent.EventHandler) (*agent.Conn, error) {
+	connect := func(context.Context, string, agent.Handlers) (*agent.Conn, error) {
 		t.Fatal("Agent connector ran before invalid idle_timeout was rejected")
 		return nil, nil
 	}
@@ -135,6 +136,61 @@ bot_token = "token"
 	)
 	if err == nil || !strings.Contains(err.Error(), "idle_timeout") {
 		t.Errorf("dev Prompt error = %v, want configured idle_timeout error", err)
+	}
+}
+
+func TestDevPromptAutoApprovesConfiguredToolKinds(t *testing.T) {
+	dataDir := t.TempDir()
+	configFile := filepath.Join(dataDir, "config.toml")
+	contents := `workspace = "/workspace"
+default_agent = "codex-acp"
+
+[permissions]
+timeout = "25ms"
+auto_approve = ["read", "search"]
+
+[telegram]
+bot_token = "token"
+`
+	if err := os.WriteFile(configFile, []byte(contents), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	script := agent.Script{Turns: []agent.Turn{{
+		Permissions: []agent.ScriptedPermission{{
+			Request: agent.PermissionRequest{
+				ToolCallID: "call-1",
+				Title:      "Read config.toml",
+				Kind:       "read",
+				Options: []agent.PermissionOption{
+					{ID: "allow-once", Name: "Allow once", Kind: agent.PermissionAllowOnce},
+					{ID: "reject-once", Name: "Reject", Kind: agent.PermissionRejectOnce},
+				},
+			},
+			WantOptionID: "allow-once",
+		}},
+		Events: []agent.Event{agent.Message{Text: "read complete"}},
+		Stop:   agent.StopEndTurn,
+	}}}
+	connect := func(ctx context.Context, _ string, handlers agent.Handlers) (*agent.Conn, error) {
+		return agent.ConnectScript(ctx, slog.New(slog.DiscardHandler), handlers, &script)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
+	defer cancel()
+	var output strings.Builder
+	_, err := devPromptWithConnector(
+		ctx,
+		slog.New(slog.DiscardHandler),
+		[]string{"-data-dir", dataDir, "-agent", "codex-acp", "read the config"},
+		&output,
+		io.Discard,
+		connect,
+	)
+	if err != nil {
+		t.Fatalf("dev Prompt with auto-approve: %v", err)
+	}
+	if got, want := output.String(), "read complete\n"; got != want {
+		t.Errorf("output = %q, want %q", got, want)
 	}
 }
 

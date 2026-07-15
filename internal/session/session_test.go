@@ -13,6 +13,7 @@ import (
 
 	"github.com/aesoteric/aethos/internal/agent"
 	"github.com/aesoteric/aethos/internal/channel"
+	"github.com/aesoteric/aethos/internal/permission"
 	"github.com/aesoteric/aethos/internal/session"
 )
 
@@ -136,6 +137,402 @@ func TestPromptToDormantSessionResumesWithFullContext(t *testing.T) {
 	}
 	if resumed.State != session.Live {
 		t.Errorf("State = %q, want %q", resumed.State, session.Live)
+	}
+}
+
+func TestPermissionRequestPausesPromptAndDoubleResolveIsIdempotent(t *testing.T) {
+	script := agent.Script{Turns: []agent.Turn{{
+		WantPrompt: "update the config",
+		Permissions: []agent.ScriptedPermission{{
+			Request: agent.PermissionRequest{
+				ToolCallID: "call-1",
+				Title:      "Update config.toml",
+				Kind:       "edit",
+				Input:      map[string]any{"path": "config.toml"},
+				Options: []agent.PermissionOption{
+					{ID: "allow-once", Name: "Allow once", Kind: agent.PermissionAllowOnce},
+					{ID: "reject-once", Name: "Reject", Kind: agent.PermissionRejectOnce},
+				},
+			},
+			WantOptionID: "allow-once",
+		}},
+		Events: []agent.Event{agent.Message{Text: "config updated"}},
+		Stop:   agent.StopEndTurn,
+	}}}
+	memory := &channel.Memory{}
+	manager, err := session.Open(t.Context(), t.TempDir()+"/aethos.db", scriptedConnector(&script), memory)
+	if err != nil {
+		t.Fatalf("session.Open: %v", err)
+	}
+	defer manager.Close()
+	record, err := manager.Create(t.Context(), session.Create{
+		Agent: "codex-acp", Workspace: t.TempDir(), Owner: session.Owner{Channel: "telegram", ID: "42"},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	type promptResult struct {
+		stop agent.StopReason
+		err  error
+	}
+	promptDone := make(chan promptResult, 1)
+	go func() {
+		stop, err := memory.Inject(t.Context(), manager, channel.Prompt{
+			SessionID: record.ID,
+			Text:      "update the config",
+		})
+		promptDone <- promptResult{stop: stop, err: err}
+	}()
+
+	waitFor(t, func() bool { return len(memory.Snapshot()) == 1 })
+	events := memory.Snapshot()
+	request, ok := events[0].AgentEvent.(agent.PermissionRequested)
+	if !ok {
+		t.Fatalf("first event = %T, want agent.PermissionRequested", events[0].AgentEvent)
+	}
+	if events[0].SessionID != record.ID {
+		t.Errorf("permission Session ID = %q, want %q", events[0].SessionID, record.ID)
+	}
+	if request.ToolCallID != "call-1" || request.Title != "Update config.toml" || request.Kind != "edit" {
+		t.Errorf("permission request = %#v, want scripted tool call", request)
+	}
+	if !reflect.DeepEqual(request.Options, []agent.PermissionOption{
+		{ID: "allow-once", Name: "Allow once", Kind: agent.PermissionAllowOnce},
+		{ID: "reject-once", Name: "Reject", Kind: agent.PermissionRejectOnce},
+	}) {
+		t.Errorf("permission options = %#v, want scripted options", request.Options)
+	}
+	select {
+	case result := <-promptDone:
+		t.Fatalf("Prompt completed before permission response: %#v", result)
+	default:
+	}
+	if err := memory.InjectPermission(t.Context(), manager, channel.PermissionResponse{
+		RequestID: request.ID,
+		OptionID:  "forged-option",
+	}); !errors.Is(err, permission.ErrUnknownOption) {
+		t.Fatalf("forged permission option error = %v, want ErrUnknownOption", err)
+	}
+
+	if err := memory.InjectPermission(t.Context(), manager, channel.PermissionResponse{
+		RequestID: request.ID,
+		OptionID:  "allow-once",
+	}); err != nil {
+		t.Fatalf("approve permission: %v", err)
+	}
+	if err := memory.InjectPermission(t.Context(), manager, channel.PermissionResponse{
+		RequestID: request.ID,
+		OptionID:  "reject-once",
+	}); err != nil {
+		t.Fatalf("repeat permission response: %v", err)
+	}
+	result := <-promptDone
+	if result.err != nil {
+		t.Fatalf("Prompt after approval: %v", result.err)
+	}
+	if result.stop != agent.StopEndTurn {
+		t.Errorf("stop reason = %q, want %q", result.stop, agent.StopEndTurn)
+	}
+
+	waitFor(t, func() bool { return len(memory.Snapshot()) == 2 })
+	got := memory.Snapshot()[1]
+	want := channel.Event{SessionID: record.ID, AgentEvent: agent.Message{Text: "config updated"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("event after approval = %#v, want %#v", got, want)
+	}
+}
+
+func TestChannelDenialReturnsToAgentAndPromptContinues(t *testing.T) {
+	script := agent.Script{Turns: []agent.Turn{{
+		Permissions: []agent.ScriptedPermission{{
+			Request: agent.PermissionRequest{
+				ToolCallID: "call-1",
+				Title:      "Run deployment",
+				Kind:       "execute",
+				Options: []agent.PermissionOption{
+					{ID: "allow-once", Name: "Allow once", Kind: agent.PermissionAllowOnce},
+					{ID: "reject-once", Name: "Reject", Kind: agent.PermissionRejectOnce},
+				},
+			},
+			WantOptionID: "reject-once",
+		}},
+		Events: []agent.Event{agent.Message{Text: "I skipped deployment and continued."}},
+		Stop:   agent.StopEndTurn,
+	}}}
+	memory := &channel.Memory{}
+	manager, err := session.Open(t.Context(), t.TempDir()+"/aethos.db", scriptedConnector(&script), memory)
+	if err != nil {
+		t.Fatalf("session.Open: %v", err)
+	}
+	defer manager.Close()
+	record, err := manager.Create(t.Context(), session.Create{
+		Agent: "codex-acp", Workspace: t.TempDir(), Owner: session.Owner{Channel: "telegram", ID: "42"},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	promptDone := make(chan error, 1)
+	go func() {
+		_, err := memory.Inject(t.Context(), manager, channel.Prompt{SessionID: record.ID, Text: "deploy"})
+		promptDone <- err
+	}()
+	waitFor(t, func() bool { return len(memory.Snapshot()) == 1 })
+	request := memory.Snapshot()[0].AgentEvent.(agent.PermissionRequested)
+	if err := memory.InjectPermission(t.Context(), manager, channel.PermissionResponse{
+		RequestID: request.ID,
+		OptionID:  "reject-once",
+	}); err != nil {
+		t.Fatalf("deny permission: %v", err)
+	}
+	if err := <-promptDone; err != nil {
+		t.Fatalf("Prompt after denial: %v", err)
+	}
+
+	want := channel.Event{SessionID: record.ID, AgentEvent: agent.Message{Text: "I skipped deployment and continued."}}
+	if got := memory.Snapshot()[1]; !reflect.DeepEqual(got, want) {
+		t.Errorf("event after denial = %#v, want %#v", got, want)
+	}
+}
+
+func TestUnansweredPermissionTimesOutAsDenialAndAgentContinues(t *testing.T) {
+	script := agent.Script{Turns: []agent.Turn{{
+		Permissions: []agent.ScriptedPermission{{
+			Request: agent.PermissionRequest{
+				ToolCallID: "call-1",
+				Title:      "Delete generated files",
+				Kind:       "delete",
+				Options: []agent.PermissionOption{
+					{ID: "allow-once", Name: "Allow once", Kind: agent.PermissionAllowOnce},
+					{ID: "reject-once", Name: "Reject", Kind: agent.PermissionRejectOnce},
+				},
+			},
+			WantOptionID: "reject-once",
+		}},
+		Events: []agent.Event{agent.Message{Text: "I left the files in place."}},
+		Stop:   agent.StopEndTurn,
+	}}}
+	memory := &channel.Memory{}
+	manager, err := session.Open(
+		t.Context(),
+		t.TempDir()+"/aethos.db",
+		scriptedConnector(&script),
+		memory,
+		session.WithPermissionTimeout(25*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatalf("session.Open: %v", err)
+	}
+	defer manager.Close()
+	record, err := manager.Create(t.Context(), session.Create{
+		Agent: "codex-acp", Workspace: t.TempDir(), Owner: session.Owner{Channel: "telegram", ID: "42"},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	stop, err := memory.Inject(t.Context(), manager, channel.Prompt{SessionID: record.ID, Text: "clean up"})
+	if err != nil {
+		t.Fatalf("Prompt after permission timeout: %v", err)
+	}
+	if stop != agent.StopEndTurn {
+		t.Errorf("stop reason = %q, want %q", stop, agent.StopEndTurn)
+	}
+	events := memory.Snapshot()
+	if len(events) != 2 {
+		t.Fatalf("events = %#v, want permission request followed by Agent response", events)
+	}
+	if _, ok := events[0].AgentEvent.(agent.PermissionRequested); !ok {
+		t.Errorf("first event = %T, want agent.PermissionRequested", events[0].AgentEvent)
+	}
+	want := channel.Event{SessionID: record.ID, AgentEvent: agent.Message{Text: "I left the files in place."}}
+	if !reflect.DeepEqual(events[1], want) {
+		t.Errorf("event after denial = %#v, want %#v", events[1], want)
+	}
+}
+
+func TestPermissionTimeoutIncludesBlockedChannelDelivery(t *testing.T) {
+	script := agent.Script{Turns: []agent.Turn{{
+		Permissions: []agent.ScriptedPermission{{
+			Request: agent.PermissionRequest{
+				ToolCallID: "call-1",
+				Title:      "Delete generated files",
+				Kind:       "delete",
+				Options: []agent.PermissionOption{
+					{ID: "allow-once", Name: "Allow once", Kind: agent.PermissionAllowOnce},
+					{ID: "reject-once", Name: "Reject", Kind: agent.PermissionRejectOnce},
+				},
+			},
+			WantOptionID: "reject-once",
+		}},
+		Events: []agent.Event{agent.Message{Text: "continued after the fail-safe denial"}},
+		Stop:   agent.StopEndTurn,
+	}}}
+	blocked := &blockingPermissionChannel{}
+	manager, err := session.Open(
+		t.Context(),
+		t.TempDir()+"/aethos.db",
+		scriptedConnector(&script),
+		blocked,
+		session.WithPermissionTimeout(25*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatalf("session.Open: %v", err)
+	}
+	defer manager.Close()
+	record, err := manager.Create(t.Context(), session.Create{
+		Agent: "codex-acp", Workspace: t.TempDir(), Owner: session.Owner{Channel: "telegram", ID: "42"},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	promptCtx, cancel := context.WithTimeout(t.Context(), 250*time.Millisecond)
+	defer cancel()
+	if _, err := manager.Prompt(promptCtx, record.ID, "clean up"); err != nil {
+		t.Fatalf("Prompt with blocked Channel delivery: %v", err)
+	}
+	want := []channel.Event{{SessionID: record.ID, AgentEvent: agent.Message{Text: "continued after the fail-safe denial"}}}
+	if got := blocked.Snapshot(); !reflect.DeepEqual(got, want) {
+		t.Errorf("delivered events = %#v, want only post-denial Agent response %#v", got, want)
+	}
+}
+
+func TestPermissionPresentationFailureDeniesAndIsReportedOnClose(t *testing.T) {
+	wantErr := errors.New("Channel unavailable")
+	script := agent.Script{Turns: []agent.Turn{{
+		Permissions: []agent.ScriptedPermission{{
+			Request: agent.PermissionRequest{
+				ToolCallID: "call-1",
+				Title:      "Edit config.toml",
+				Kind:       "edit",
+				Options: []agent.PermissionOption{
+					{ID: "allow-once", Name: "Allow once", Kind: agent.PermissionAllowOnce},
+					{ID: "reject-once", Name: "Reject", Kind: agent.PermissionRejectOnce},
+				},
+			},
+			WantOptionID: "reject-once",
+		}},
+		Events: []agent.Event{agent.Message{Text: "I did not edit the file."}},
+		Stop:   agent.StopEndTurn,
+	}}}
+	failing := &permissionFailureChannel{err: wantErr}
+	manager, err := session.Open(t.Context(), t.TempDir()+"/aethos.db", scriptedConnector(&script), failing)
+	if err != nil {
+		t.Fatalf("session.Open: %v", err)
+	}
+	record, err := manager.Create(t.Context(), session.Create{
+		Agent: "codex-acp", Workspace: t.TempDir(), Owner: session.Owner{Channel: "telegram", ID: "42"},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	if _, err := manager.Prompt(t.Context(), record.ID, "edit the config"); err != nil {
+		t.Fatalf("Prompt after permission presentation failure: %v", err)
+	}
+	want := []channel.Event{{SessionID: record.ID, AgentEvent: agent.Message{Text: "I did not edit the file."}}}
+	if got := failing.Snapshot(); !reflect.DeepEqual(got, want) {
+		t.Errorf("delivered events = %#v, want Agent response after denial %#v", got, want)
+	}
+	if err := manager.Close(); !errors.Is(err, wantErr) {
+		t.Errorf("Close error = %v, want reported Channel failure", err)
+	}
+}
+
+func TestCancelWhilePermissionIsPendingDoesNotLeavePromptHanging(t *testing.T) {
+	script := agent.Script{Turns: []agent.Turn{{
+		Permissions: []agent.ScriptedPermission{{
+			Request: agent.PermissionRequest{
+				ToolCallID: "call-1",
+				Title:      "Run deployment",
+				Kind:       "execute",
+				Options: []agent.PermissionOption{
+					{ID: "allow-once", Name: "Allow once", Kind: agent.PermissionAllowOnce},
+					{ID: "reject-once", Name: "Reject", Kind: agent.PermissionRejectOnce},
+				},
+			},
+			WantCancelled: true,
+		}},
+		Stop: agent.StopEndTurn,
+	}}}
+	memory := &channel.Memory{}
+	manager, err := session.Open(t.Context(), t.TempDir()+"/aethos.db", scriptedConnector(&script), memory)
+	if err != nil {
+		t.Fatalf("session.Open: %v", err)
+	}
+	defer manager.Close()
+	record, err := manager.Create(t.Context(), session.Create{
+		Agent: "codex-acp", Workspace: t.TempDir(), Owner: session.Owner{Channel: "telegram", ID: "42"},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	promptDone := make(chan error, 1)
+	go func() {
+		_, err := memory.Inject(t.Context(), manager, channel.Prompt{SessionID: record.ID, Text: "deploy"})
+		promptDone <- err
+	}()
+	waitFor(t, func() bool {
+		events := memory.Snapshot()
+		return len(events) == 1
+	})
+
+	cancelCtx, cancel := context.WithTimeout(t.Context(), 250*time.Millisecond)
+	defer cancel()
+	if err := manager.Cancel(cancelCtx, record.ID); err != nil {
+		t.Fatalf("Cancel pending permission: %v", err)
+	}
+	if err := <-promptDone; !errors.Is(err, context.Canceled) {
+		t.Errorf("cancelled Prompt error = %v, want context.Canceled", err)
+	}
+}
+
+func TestAutoApprovedToolKindDoesNotSurfacePermissionToChannel(t *testing.T) {
+	script := agent.Script{Turns: []agent.Turn{{
+		Permissions: []agent.ScriptedPermission{{
+			Request: agent.PermissionRequest{
+				ToolCallID: "call-1",
+				Title:      "Read main.go",
+				Kind:       "read",
+				Options: []agent.PermissionOption{
+					{ID: "allow-always", Name: "Allow always", Kind: agent.PermissionAllowAlways},
+					{ID: "allow-once", Name: "Allow once", Kind: agent.PermissionAllowOnce},
+					{ID: "reject-once", Name: "Reject", Kind: agent.PermissionRejectOnce},
+				},
+			},
+			WantOptionID: "allow-once",
+		}},
+		Events: []agent.Event{agent.Message{Text: "main.go is readable"}},
+		Stop:   agent.StopEndTurn,
+	}}}
+	memory := &channel.Memory{}
+	manager, err := session.Open(
+		t.Context(),
+		t.TempDir()+"/aethos.db",
+		scriptedConnector(&script),
+		memory,
+		session.WithAutoApprove("read"),
+	)
+	if err != nil {
+		t.Fatalf("session.Open: %v", err)
+	}
+	defer manager.Close()
+	record, err := manager.Create(t.Context(), session.Create{
+		Agent: "codex-acp", Workspace: t.TempDir(), Owner: session.Owner{Channel: "telegram", ID: "42"},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	if _, err := memory.Inject(t.Context(), manager, channel.Prompt{SessionID: record.ID, Text: "inspect main.go"}); err != nil {
+		t.Fatalf("Prompt with auto-approved read: %v", err)
+	}
+	want := []channel.Event{{SessionID: record.ID, AgentEvent: agent.Message{Text: "main.go is readable"}}}
+	if got := memory.Snapshot(); !reflect.DeepEqual(got, want) {
+		t.Errorf("Channel events = %#v, want only Agent response %#v", got, want)
 	}
 }
 
@@ -740,7 +1137,7 @@ func TestOpenRejectsDatabaseFromNewerAethos(t *testing.T) {
 		t.Fatalf("close fixture database: %v", err)
 	}
 
-	connect := func(ctx context.Context, command string, onEvent agent.EventHandler) (*agent.Conn, error) {
+	connect := func(ctx context.Context, command string, handlers agent.Handlers) (*agent.Conn, error) {
 		return nil, errors.New("connector must not run while opening the database")
 	}
 	_, err = session.Open(t.Context(), database, connect, &channel.Memory{})
@@ -776,9 +1173,35 @@ type errorChannel struct{ err error }
 
 func (c errorChannel) Send(context.Context, channel.Event) error { return c.err }
 
+type blockingPermissionChannel struct{ memory channel.Memory }
+
+func (c *blockingPermissionChannel) Send(ctx context.Context, event channel.Event) error {
+	if _, permission := event.AgentEvent.(agent.PermissionRequested); permission {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return c.memory.Send(ctx, event)
+}
+
+func (c *blockingPermissionChannel) Snapshot() []channel.Event { return c.memory.Snapshot() }
+
+type permissionFailureChannel struct {
+	memory channel.Memory
+	err    error
+}
+
+func (c *permissionFailureChannel) Send(ctx context.Context, event channel.Event) error {
+	if _, permission := event.AgentEvent.(agent.PermissionRequested); permission {
+		return c.err
+	}
+	return c.memory.Send(ctx, event)
+}
+
+func (c *permissionFailureChannel) Snapshot() []channel.Event { return c.memory.Snapshot() }
+
 func scriptedConnector(script *agent.Script) session.Connect {
-	return func(ctx context.Context, _ string, onEvent agent.EventHandler) (*agent.Conn, error) {
-		return agent.ConnectScript(ctx, slog.New(slog.DiscardHandler), onEvent, script)
+	return func(ctx context.Context, _ string, handlers agent.Handlers) (*agent.Conn, error) {
+		return agent.ConnectScript(ctx, slog.New(slog.DiscardHandler), handlers, script)
 	}
 }
 
