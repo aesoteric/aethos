@@ -31,10 +31,15 @@ type ToolCallProgressed struct {
 	Status string
 }
 
+// Crashed reports that the Agent connection exited unexpectedly. The Session
+// manager demotes the durable Session before delivering this event.
+type Crashed struct{ Error string }
+
 func (Thought) isEvent()            {}
 func (Message) isEvent()            {}
 func (ToolCallBegan) isEvent()      {}
 func (ToolCallProgressed) isEvent() {}
+func (Crashed) isEvent()            {}
 
 // EventHandler receives every translated Event of a Conn in arrival order,
 // tagged with the id of the session it belongs to. Handlers run on the

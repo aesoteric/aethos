@@ -4,6 +4,9 @@ workspace = "/srv/aethos-workspace"
 # Command used to start the default Agent.
 default_agent = "npx @zed-industries/claude-code-acp"
 
+# Time with no Prompt work before a live Session becomes dormant.
+idle_timeout = "45m"
+
 # Token used by the Telegram Channel.
 [telegram]
 bot_token = "file-token"

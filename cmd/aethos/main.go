@@ -160,9 +160,24 @@ func devPromptWithConnector(
 	if err := os.MkdirAll(paths.DataDir, 0o700); err != nil {
 		return "", fmt.Errorf("create data directory %q: %w", paths.DataDir, err)
 	}
+	idleTimeout := config.DefaultIdleTimeout
+	configured, configErr := config.Load(paths.ConfigFile)
+	switch {
+	case configErr == nil:
+		idleTimeout = time.Duration(configured.IdleTimeout)
+	case errors.Is(configErr, os.ErrNotExist):
+	default:
+		return "", configErr
+	}
 
 	r := &renderer{w: stdout}
-	manager, err := session.Open(ctx, paths.DatabaseFile, connect, r)
+	manager, err := session.Open(
+		ctx,
+		paths.DatabaseFile,
+		connect,
+		r,
+		session.WithIdleTimeout(idleTimeout),
+	)
 	if err != nil {
 		return "", err
 	}

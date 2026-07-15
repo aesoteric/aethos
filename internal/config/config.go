@@ -8,9 +8,33 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/BurntSushi/toml"
 )
+
+// DefaultIdleTimeout bounds how long an Agent subprocess remains attached
+// without Prompt work when config.toml does not override it.
+const DefaultIdleTimeout = 30 * time.Minute
+
+// Duration is a TOML duration encoded with Go's human-readable duration
+// syntax, for example "30m" or "2h15m".
+type Duration time.Duration
+
+// UnmarshalText parses one TOML duration string.
+func (duration *Duration) UnmarshalText(text []byte) error {
+	parsed, err := time.ParseDuration(string(text))
+	if err != nil {
+		return fmt.Errorf("idle_timeout must be a duration such as 30m: %w", err)
+	}
+	*duration = Duration(parsed)
+	return nil
+}
+
+// MarshalText formats a duration for config.toml.
+func (duration Duration) MarshalText() ([]byte, error) {
+	return []byte(time.Duration(duration).String()), nil
+}
 
 const (
 	dataDirEnv      = "AETHOS_DATA_DIR"
@@ -36,6 +60,7 @@ type Telegram struct {
 type Config struct {
 	Workspace    string   `toml:"workspace"`
 	DefaultAgent string   `toml:"default_agent"`
+	IdleTimeout  Duration `toml:"idle_timeout"`
 	Telegram     Telegram `toml:"telegram"`
 }
 
@@ -81,7 +106,7 @@ func absolutePath(name, path string) (string, error) {
 
 // Load reads, overlays, and validates a TOML configuration file.
 func Load(path string) (Config, error) {
-	var cfg Config
+	cfg := Config{IdleTimeout: Duration(DefaultIdleTimeout)}
 	metadata, err := toml.DecodeFile(path, &cfg)
 	if err != nil {
 		return Config{}, fmt.Errorf("parse config %q: %w", path, err)
@@ -126,6 +151,9 @@ func (c Config) Validate() error {
 	}
 	if strings.TrimSpace(c.DefaultAgent) == "" {
 		return fmt.Errorf("default_agent is required (set it in config.toml or %s)", defaultAgentEnv)
+	}
+	if c.IdleTimeout <= 0 {
+		return fmt.Errorf("idle_timeout must be greater than zero")
 	}
 	return nil
 }

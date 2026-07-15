@@ -70,6 +70,12 @@ func (r *renderer) render(_ context.Context, _ string, ev agent.Event) error {
 		}
 		_, err := fmt.Fprintln(r.w, line)
 		return err
+	case agent.Crashed:
+		if err := r.breakLine(); err != nil {
+			return err
+		}
+		_, err := fmt.Fprintf(r.w, "[agent crashed] %s\n", e.Error)
+		return err
 	}
 	return nil
 }

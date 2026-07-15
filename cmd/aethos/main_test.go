@@ -107,6 +107,37 @@ func TestDevPromptPersistsAndResumesSession(t *testing.T) {
 	}
 }
 
+func TestDevPromptUsesConfiguredIdleTimeout(t *testing.T) {
+	dataDir := t.TempDir()
+	configFile := filepath.Join(dataDir, "config.toml")
+	contents := `workspace = "/workspace"
+default_agent = "codex-acp"
+idle_timeout = "never"
+
+[telegram]
+bot_token = "token"
+`
+	if err := os.WriteFile(configFile, []byte(contents), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	connect := func(context.Context, string, agent.EventHandler) (*agent.Conn, error) {
+		t.Fatal("Agent connector ran before invalid idle_timeout was rejected")
+		return nil, nil
+	}
+
+	_, err := devPromptWithConnector(
+		t.Context(),
+		slog.New(slog.DiscardHandler),
+		[]string{"-data-dir", dataDir, "-agent", "codex-acp", "hello"},
+		io.Discard,
+		io.Discard,
+		connect,
+	)
+	if err == nil || !strings.Contains(err.Error(), "idle_timeout") {
+		t.Errorf("dev Prompt error = %v, want configured idle_timeout error", err)
+	}
+}
+
 func TestRunFirstRunWritesConfigThenLaterRunBootsSilently(t *testing.T) {
 	unsetEnv(t, "AETHOS_DATA_DIR")
 	unsetEnv(t, "AETHOS_TELEGRAM_BOT_TOKEN")

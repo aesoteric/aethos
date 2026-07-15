@@ -41,6 +41,10 @@ and log paths are all rooted there. Environment values override the file:
 - `AETHOS_WORKSPACE`
 - `AETHOS_DEFAULT_AGENT`
 
+`idle_timeout` is a human-readable duration such as `"30m"` or `"2h"`. It
+defaults to 30 minutes and controls how long a live Session with no Prompt work
+keeps its Agent subprocess attached.
+
 Invalid TOML, unknown fields, and missing required values stop startup with an
 actionable error.
 
@@ -51,9 +55,15 @@ the Agent, Workspace, owner identity, lifecycle state, and activity timestamps.
 Live Sessions become dormant during shutdown and transparently resume their ACP
 Session on the next Prompt after a restart.
 
-Prompts are processed in arrival order within each Session. The waiting queue is
-intentionally in memory: a restart drops Prompts that had not started, while the
-durable Session record and Agent context remain available for the next Prompt.
+Prompts are processed in arrival order within each Session. A running Prompt can
+be cancelled without discarding its Session. Agent crashes and idle timeouts
+demote live Sessions to dormant and release the subprocess; the next Prompt
+resumes them. Explicitly closed Sessions remain listed as archived records and
+cannot be resumed by a plain Prompt.
+
+The waiting queue is intentionally in memory: a restart drops Prompts that had
+not started, while the durable Session record and Agent context remain available
+for the next Prompt.
 
 ## Development
 

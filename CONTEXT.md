@@ -17,11 +17,11 @@ An ACP-compatible coding agent (Claude Code, Codex, Gemini, …) that aethos spa
 _Avoid_: bot, assistant, model
 
 **Session**:
-One conversation between a user and one agent, bound to a workspace and (on Telegram) a topic. Prompts within a session are strictly serial. Either live or dormant; never auto-deleted.
+One conversation between a user and one Agent, bound to a Workspace and (on Telegram) a Topic. Prompts within a Session are strictly serial. Live, dormant, or deliberately closed; never auto-deleted.
 _Avoid_: chat, thread, conversation
 
-**Live** / **Dormant**:
-The two session states. Live: an agent subprocess is attached. Dormant: only the persisted record exists; the next prompt auto-resumes it. Idle timeout demotes live → dormant.
+**Live** / **Dormant** / **Closed**:
+The three Session states. Live: an Agent subprocess is attached. Dormant: only the persisted record exists; the next Prompt auto-resumes it. Closed: deliberately archived and terminal; it remains listable but a plain Prompt cannot resume it. Idle timeout and Agent crashes demote live → dormant.
 _Avoid_: active/expired, running/dead
 
 **Workspace**:

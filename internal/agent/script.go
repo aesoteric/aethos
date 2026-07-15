@@ -21,12 +21,16 @@ type Turn struct {
 	Continue    <-chan struct{}
 	Events      []Event
 	Stop        StopReason
+	Crash       bool
 }
 
 // Script is a canned Agent performance shared across connections. Sharing is
 // deliberate: it models an Agent's durable Session context across restarts.
 type Script struct {
 	Turns []Turn
+	// Exit simulates the scripted Agent process exiting independently of a
+	// Prompt. Sending an error tears down the active scripted connection.
+	Exit <-chan error
 
 	mu       sync.Mutex
 	next     int
@@ -52,13 +56,36 @@ func ConnectScript(ctx context.Context, logger *slog.Logger, onEvent EventHandle
 		attached: make(map[string]bool),
 		active:   make(map[string]chan struct{}),
 	}
+	lifecycle := newConnectionLifecycle()
+	crash := func(err error) {
+		if err == nil {
+			err = errors.New("scripted Agent subprocess exited")
+		}
+		clientCloseErr := clientToAgentW.CloseWithError(err)
+		agentCloseErr := agentToClientW.CloseWithError(err)
+		lifecycle.finish(errors.Join(err, clientCloseErr, agentCloseErr))
+	}
+	fake.crash = crash
+	if script.Exit != nil {
+		go func() {
+			select {
+			case err, ok := <-script.Exit:
+				if ok {
+					crash(err)
+				}
+			case <-lifecycle.done:
+			}
+		}()
+	}
 	fake.conn = sdk.NewAgentSideConnection(fake, agentToClientW, clientToAgentR)
 	fake.conn.SetLogger(logger)
 
 	shutdown := func() error {
-		return errors.Join(clientToAgentW.Close(), agentToClientW.Close())
+		err := errors.Join(clientToAgentW.Close(), agentToClientW.Close())
+		lifecycle.finish(nil)
+		return err
 	}
-	return connect(ctx, logger, onEvent, clientToAgentW, agentToClientR, shutdown)
+	return connect(ctx, logger, onEvent, clientToAgentW, agentToClientR, shutdown, lifecycle)
 }
 
 // EventLog is a race-safe event collector for flow tests: pass Record as
@@ -95,6 +122,7 @@ type scriptedAgent struct {
 	script   *Script
 	attached map[string]bool
 	active   map[string]chan struct{}
+	crash    func(error)
 }
 
 var _ sdk.Agent = (*scriptedAgent)(nil)
@@ -181,6 +209,11 @@ func (a *scriptedAgent) Prompt(ctx context.Context, p sdk.PromptRequest) (sdk.Pr
 		case <-cancelled:
 			return sdk.PromptResponse{}, context.Canceled
 		}
+	}
+	if turn.Crash {
+		err := errors.New("scripted Agent subprocess crashed")
+		a.crash(err)
+		return sdk.PromptResponse{}, err
 	}
 
 	for _, ev := range turn.Events {

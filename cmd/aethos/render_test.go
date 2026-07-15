@@ -74,6 +74,17 @@ func TestRendererReportsWriteFailure(t *testing.T) {
 	}
 }
 
+func TestRendererShowsAgentCrash(t *testing.T) {
+	var out strings.Builder
+	r := &renderer{w: &out}
+	if err := r.render(context.Background(), "session-1", agent.Crashed{Error: "signal: killed"}); err != nil {
+		t.Fatalf("render crash: %v", err)
+	}
+	if got, want := out.String(), "[agent crashed] signal: killed\n"; got != want {
+		t.Errorf("rendered crash = %q, want %q", got, want)
+	}
+}
+
 type errorWriter struct{ err error }
 
 func (w errorWriter) Write([]byte) (int, error) { return 0, w.err }

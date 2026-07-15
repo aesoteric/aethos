@@ -21,10 +21,37 @@ type Conn struct {
 	logger       *slog.Logger
 	onEvent      EventHandler
 	shutdown     func() error
+	lifecycle    *connectionLifecycle
 	closeOnce    sync.Once
 	closeErr     error
 	eventMu      sync.Mutex
 	eventErrors  map[string]error
+}
+
+type connectionLifecycle struct {
+	done chan struct{}
+	once sync.Once
+	mu   sync.Mutex
+	err  error
+}
+
+func newConnectionLifecycle() *connectionLifecycle {
+	return &connectionLifecycle{done: make(chan struct{})}
+}
+
+func (l *connectionLifecycle) finish(err error) {
+	l.once.Do(func() {
+		l.mu.Lock()
+		l.err = err
+		l.mu.Unlock()
+		close(l.done)
+	})
+}
+
+func (l *connectionLifecycle) exitError() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.err
 }
 
 // Spawn launches an ACP agent subprocess, connects over its stdio, and
@@ -46,6 +73,10 @@ func Spawn(ctx context.Context, logger *slog.Logger, onEvent EventHandler, name 
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("spawn agent %q: %w", name, err)
 	}
+	lifecycle := newConnectionLifecycle()
+	go func() {
+		lifecycle.finish(cmd.Wait())
+	}()
 	// Teardown errors are discarded deliberately: killing the agent makes
 	// Wait report "signal: killed" on every clean shutdown.
 	shutdown := func() error {
@@ -53,16 +84,24 @@ func Spawn(ctx context.Context, logger *slog.Logger, onEvent EventHandler, name 
 		if cmd.Process != nil {
 			_ = cmd.Process.Kill()
 		}
-		_ = cmd.Wait()
+		<-lifecycle.done
 		return nil
 	}
-	return connect(ctx, logger, onEvent, stdin, stdout, shutdown)
+	return connect(ctx, logger, onEvent, stdin, stdout, shutdown, lifecycle)
 }
 
 // connect wires the client side of an ACP connection over the given
 // pipes and performs the initialize handshake.
-func connect(ctx context.Context, logger *slog.Logger, onEvent EventHandler, peerIn io.Writer, peerOut io.Reader, shutdown func() error) (*Conn, error) {
-	c := &Conn{logger: logger, onEvent: onEvent, shutdown: shutdown}
+func connect(
+	ctx context.Context,
+	logger *slog.Logger,
+	onEvent EventHandler,
+	peerIn io.Writer,
+	peerOut io.Reader,
+	shutdown func() error,
+	lifecycle *connectionLifecycle,
+) (*Conn, error) {
+	c := &Conn{logger: logger, onEvent: onEvent, shutdown: shutdown, lifecycle: lifecycle}
 	c.sdk = sdk.NewClientSideConnection(&client{conn: c}, peerIn, peerOut)
 	c.sdk.SetLogger(logger)
 	initialized, err := c.sdk.Initialize(ctx, sdk.InitializeRequest{
@@ -78,6 +117,14 @@ func connect(ctx context.Context, logger *slog.Logger, onEvent EventHandler, pee
 	c.capabilities = initialized.AgentCapabilities
 	return c, nil
 }
+
+// Done closes when the Agent connection exits, either unexpectedly or after
+// Close. ExitError reports the process or transport error, if any.
+func (c *Conn) Done() <-chan struct{} { return c.lifecycle.done }
+
+// ExitError returns the error that ended the Agent connection. Callers should
+// wait for Done before reading it.
+func (c *Conn) ExitError() error { return c.lifecycle.exitError() }
 
 // NewSession opens a new ACP session rooted at the Workspace directory,
 // which must be an absolute path.
@@ -137,6 +184,14 @@ func (c *Conn) Prompt(ctx context.Context, sessionID, text string) (StopReason, 
 		return "", errors.Join(wrapError("prompt", err), eventErr)
 	}
 	return StopReason(resp.StopReason), nil
+}
+
+// Cancel asks the Agent to stop the Prompt currently running in sessionID.
+func (c *Conn) Cancel(ctx context.Context, sessionID string) error {
+	if err := c.sdk.Cancel(ctx, sdk.CancelNotification{SessionId: sdk.SessionId(sessionID)}); err != nil {
+		return fmt.Errorf("cancel prompt: %w", err)
+	}
+	return nil
 }
 
 func (c *Conn) clearEventError(sessionID string) {

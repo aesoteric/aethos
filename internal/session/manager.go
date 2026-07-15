@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,7 +26,24 @@ const (
 	Live State = "live"
 	// Dormant means the record is durable but no Agent connection is attached.
 	Dormant State = "dormant"
+	// Closed means the Session was deliberately archived and cannot resume.
+	Closed State = "closed"
 )
+
+// CanTransitionTo reports whether next is a valid lifecycle transition from
+// state. Creation enters Live directly; Closed is terminal.
+func (state State) CanTransitionTo(next State) bool {
+	switch state {
+	case Live:
+		return next == Dormant || next == Closed
+	case Dormant:
+		return next == Live || next == Closed
+	case Closed:
+		return false
+	default:
+		return false
+	}
+}
 
 // Owner identifies the person or machine that created a Session. Channel
 // disambiguates identities from different user-facing Channels.
@@ -57,9 +75,40 @@ type Record struct {
 // ACP Agent connector.
 type Connect func(context.Context, string, agent.EventHandler) (*agent.Conn, error)
 
+// Option configures Session lifecycle behavior when a Manager opens.
+type Option func(*openOptions) error
+
+type openOptions struct {
+	idleTimeout time.Duration
+}
+
+// WithIdleTimeout demotes live Sessions after they have had no Prompt work for
+// timeout. A zero timeout disables automatic idle demotion.
+func WithIdleTimeout(timeout time.Duration) Option {
+	return func(options *openOptions) error {
+		if timeout < 0 {
+			return fmt.Errorf("idle timeout cannot be negative")
+		}
+		options.idleTimeout = timeout
+		return nil
+	}
+}
+
 // ErrClosed is returned to in-flight and queued Prompts when the Session
 // manager shuts down. Queued Prompts are intentionally not durable.
 var ErrClosed = errors.New("session manager is closed")
+
+// ErrNoPrompt is returned when cancellation is requested for a Session that
+// has no Prompt in flight.
+var ErrNoPrompt = errors.New("session has no Prompt in flight")
+
+// ErrSessionClosed is returned when an operation would resume or mutate an
+// explicitly archived Session.
+var ErrSessionClosed = errors.New("session is closed")
+
+// ErrInvalidTransition is returned when a lifecycle operation attempts an
+// edge outside the live/dormant/closed state machine.
+var ErrInvalidTransition = errors.New("invalid Session state transition")
 
 // Manager owns durable Session records, their live Agent connections, and
 // prompt serialization.
@@ -70,10 +119,13 @@ type Manager struct {
 	ctx     context.Context
 	cancel  context.CancelFunc
 
-	mu       sync.Mutex
-	sessions map[string]*managedSession
-	closed   bool
-	workers  sync.WaitGroup
+	idleTimeout time.Duration
+
+	mu            sync.Mutex
+	sessions      map[string]*managedSession
+	closed        bool
+	backgroundErr error
+	workers       sync.WaitGroup
 }
 
 type managedSession struct {
@@ -82,14 +134,19 @@ type managedSession struct {
 	agentSessionID string
 	conn           *agent.Conn
 	queue          []*promptCall
+	current        *promptCall
 	working        bool
 	closing        bool
+	idleTimer      *time.Timer
 }
 
 type promptCall struct {
 	ctx    context.Context
 	text   string
 	result chan promptResult
+	done   chan struct{}
+	cancel atomic.Bool
+	closed atomic.Bool
 }
 
 type promptResult struct {
@@ -99,7 +156,7 @@ type promptResult struct {
 
 // Open opens the Session database, applies versioned migrations, and recovers
 // records left live by an interrupted process as dormant.
-func Open(ctx context.Context, databasePath string, connect Connect, ch channel.Channel) (*Manager, error) {
+func Open(ctx context.Context, databasePath string, connect Connect, ch channel.Channel, option ...Option) (*Manager, error) {
 	if !filepath.IsAbs(databasePath) {
 		return nil, fmt.Errorf("database path must be absolute, got %q", databasePath)
 	}
@@ -109,6 +166,15 @@ func Open(ctx context.Context, databasePath string, connect Connect, ch channel.
 	if ch == nil {
 		return nil, fmt.Errorf("channel is required")
 	}
+	var options openOptions
+	for _, configure := range option {
+		if configure == nil {
+			return nil, fmt.Errorf("session option is required")
+		}
+		if err := configure(&options); err != nil {
+			return nil, fmt.Errorf("configure Session manager: %w", err)
+		}
+	}
 
 	db, err := openDatabase(ctx, databasePath)
 	if err != nil {
@@ -116,12 +182,13 @@ func Open(ctx context.Context, databasePath string, connect Connect, ch channel.
 	}
 	lifecycle, cancel := context.WithCancel(context.Background())
 	m := &Manager{
-		db:       db,
-		connect:  connect,
-		channel:  ch,
-		ctx:      lifecycle,
-		cancel:   cancel,
-		sessions: make(map[string]*managedSession),
+		db:          db,
+		connect:     connect,
+		channel:     ch,
+		ctx:         lifecycle,
+		cancel:      cancel,
+		idleTimeout: options.idleTimeout,
+		sessions:    make(map[string]*managedSession),
 	}
 	if err := m.load(ctx); err != nil {
 		cancel()
@@ -183,7 +250,12 @@ func (m *Manager) Create(ctx context.Context, create Create) (Record, error) {
 			annotate("demote interrupted Session", demoteErr),
 		)
 	}
-	m.sessions[id] = &managedSession{record: record, agentSessionID: agentSessionID, conn: conn}
+	managed := &managedSession{record: record, agentSessionID: agentSessionID, conn: conn}
+	m.sessions[id] = managed
+	managed.mu.Lock()
+	m.armIdleLocked(id, managed)
+	managed.mu.Unlock()
+	go m.watchConnection(id, managed, conn)
 	return record, nil
 }
 
@@ -191,7 +263,12 @@ func (m *Manager) Create(ctx context.Context, create Create) (Record, error) {
 // Agent connection before dispatch. Concurrent calls are processed in the
 // order they enter the Session's queue.
 func (m *Manager) Prompt(ctx context.Context, id, text string) (agent.StopReason, error) {
-	call := &promptCall{ctx: ctx, text: text, result: make(chan promptResult, 1)}
+	call := &promptCall{
+		ctx:    ctx,
+		text:   text,
+		result: make(chan promptResult, 1),
+		done:   make(chan struct{}),
+	}
 
 	m.mu.Lock()
 	if m.closed {
@@ -204,6 +281,12 @@ func (m *Manager) Prompt(ctx context.Context, id, text string) (agent.StopReason
 		return "", fmt.Errorf("prompt Session %q: %w", id, sql.ErrNoRows)
 	}
 	managed.mu.Lock()
+	if managed.record.State == Closed {
+		managed.mu.Unlock()
+		m.mu.Unlock()
+		return "", fmt.Errorf("prompt Session %q: %w", id, ErrSessionClosed)
+	}
+	m.stopIdleLocked(managed)
 	managed.queue = append(managed.queue, call)
 	if !managed.working {
 		managed.working = true
@@ -227,20 +310,67 @@ func (m *Manager) work(id string, managed *managedSession) {
 		managed.mu.Lock()
 		if len(managed.queue) == 0 {
 			managed.working = false
+			m.armIdleLocked(id, managed)
 			managed.mu.Unlock()
 			return
 		}
 		call := managed.queue[0]
 		managed.queue[0] = nil
 		managed.queue = managed.queue[1:]
+		managed.current = call
 		managed.mu.Unlock()
 
-		stop, err := m.runPrompt(call.ctx, id, managed, call.text)
+		stop, err := m.runPrompt(call.ctx, id, managed, call)
 		call.result <- promptResult{stop: stop, err: err}
+		managed.mu.Lock()
+		managed.current = nil
+		close(call.done)
+		managed.mu.Unlock()
 	}
 }
 
-func (m *Manager) runPrompt(ctx context.Context, id string, managed *managedSession, text string) (agent.StopReason, error) {
+// Cancel stops the Prompt currently running for id and waits until the
+// Session worker has released it so another Prompt can begin immediately.
+func (m *Manager) Cancel(ctx context.Context, id string) error {
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return fmt.Errorf("cancel Prompt for Session %q: %w", id, ErrClosed)
+	}
+	managed, ok := m.sessions[id]
+	if !ok {
+		m.mu.Unlock()
+		return fmt.Errorf("cancel Prompt for Session %q: %w", id, sql.ErrNoRows)
+	}
+	managed.mu.Lock()
+	m.mu.Unlock()
+	if managed.record.State == Closed {
+		managed.mu.Unlock()
+		return fmt.Errorf("cancel Prompt for Session %q: %w", id, ErrSessionClosed)
+	}
+	call := managed.current
+	conn := managed.conn
+	if call == nil || conn == nil {
+		managed.mu.Unlock()
+		return fmt.Errorf("cancel Prompt for Session %q: %w", id, ErrNoPrompt)
+	}
+	agentSessionID := managed.agentSessionID
+	call.cancel.Store(true)
+	if err := conn.Cancel(ctx, agentSessionID); err != nil {
+		call.cancel.Store(false)
+		managed.mu.Unlock()
+		return fmt.Errorf("cancel Prompt for Session %q: %w", id, err)
+	}
+	managed.mu.Unlock()
+	select {
+	case <-call.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (m *Manager) runPrompt(ctx context.Context, id string, managed *managedSession, call *promptCall) (agent.StopReason, error) {
 	turnCtx, cancel := context.WithCancel(ctx)
 	stopLifecycleCancel := context.AfterFunc(m.ctx, cancel)
 	defer func() {
@@ -258,11 +388,22 @@ func (m *Manager) runPrompt(ctx context.Context, id string, managed *managedSess
 		}
 		return "", err
 	}
-	stop, err := conn.Prompt(turnCtx, managed.agentSessionID, text)
+	stop, err := conn.Prompt(turnCtx, managed.agentSessionID, call.text)
 	if m.ctx.Err() != nil {
 		return "", ErrClosed
 	}
+	if call.closed.Load() {
+		return "", ErrSessionClosed
+	}
 	if err != nil {
+		if call.cancel.Load() {
+			return "", context.Canceled
+		}
+		select {
+		case <-conn.Done():
+			m.connectionEnded(id, managed, conn)
+		default:
+		}
 		return "", err
 	}
 
@@ -283,10 +424,13 @@ func (m *Manager) liveConnection(ctx context.Context, id string, managed *manage
 	managed.mu.Lock()
 	defer managed.mu.Unlock()
 	if managed.closing {
-		return nil, ErrClosed
+		return nil, ErrSessionClosed
 	}
 	if managed.conn != nil {
 		return managed.conn, nil
+	}
+	if !managed.record.State.CanTransitionTo(Live) {
+		return nil, fmt.Errorf("resume Session %q from %q: %w", id, managed.record.State, ErrInvalidTransition)
 	}
 
 	var resuming atomic.Bool
@@ -312,7 +456,60 @@ func (m *Manager) liveConnection(ctx context.Context, id string, managed *manage
 	}
 	managed.conn = conn
 	managed.record.State = Live
+	go m.watchConnection(id, managed, conn)
 	return conn, nil
+}
+
+func (m *Manager) watchConnection(id string, managed *managedSession, conn *agent.Conn) {
+	<-conn.Done()
+	m.connectionEnded(id, managed, conn)
+}
+
+func (m *Manager) connectionEnded(id string, managed *managedSession, conn *agent.Conn) {
+	m.mu.Lock()
+	if m.closed || m.sessions[id] != managed {
+		m.mu.Unlock()
+		return
+	}
+	managed.mu.Lock()
+	if managed.conn != conn || managed.record.State != Live {
+		managed.mu.Unlock()
+		m.mu.Unlock()
+		return
+	}
+
+	now := time.Now().UTC()
+	if _, err := m.db.ExecContext(m.ctx, `UPDATE sessions SET state = ?, last_activity_at = ? WHERE id = ?`, Dormant, now.UnixNano(), id); err != nil {
+		managed.mu.Unlock()
+		m.backgroundErr = errors.Join(m.backgroundErr, fmt.Errorf("demote crashed Session %q: %w", id, err))
+		m.mu.Unlock()
+		return
+	}
+	m.stopIdleLocked(managed)
+	managed.conn = nil
+	managed.record.State = Dormant
+	managed.record.LastActivityAt = now
+	managed.mu.Unlock()
+	m.mu.Unlock()
+
+	exitErr := conn.ExitError()
+	if err := closeAgent(conn); err != nil {
+		m.mu.Lock()
+		m.backgroundErr = errors.Join(m.backgroundErr, fmt.Errorf("clean up crashed Session %q: %w", id, err))
+		m.mu.Unlock()
+	}
+	message := "Agent subprocess exited unexpectedly"
+	if exitErr != nil {
+		message = exitErr.Error()
+	}
+	if err := m.channel.Send(m.ctx, channel.Event{
+		SessionID:  id,
+		AgentEvent: agent.Crashed{Error: message},
+	}); err != nil {
+		m.mu.Lock()
+		m.backgroundErr = errors.Join(m.backgroundErr, fmt.Errorf("surface crashed Session %q: %w", id, err))
+		m.mu.Unlock()
+	}
 }
 
 // Get returns the latest durable record for id.
@@ -326,6 +523,98 @@ func (m *Manager) Get(_ context.Context, id string) (Record, error) {
 	managed.mu.Lock()
 	defer managed.mu.Unlock()
 	return managed.record, nil
+}
+
+// List returns every Session, including archived Sessions, in creation order.
+func (m *Manager) List(_ context.Context) ([]Record, error) {
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("list Sessions: %w", ErrClosed)
+	}
+	managed := make([]*managedSession, 0, len(m.sessions))
+	for _, one := range m.sessions {
+		managed = append(managed, one)
+	}
+	m.mu.Unlock()
+
+	records := make([]Record, 0, len(managed))
+	for _, one := range managed {
+		one.mu.Lock()
+		records = append(records, one.record)
+		one.mu.Unlock()
+	}
+	slices.SortFunc(records, func(a, b Record) int {
+		if order := a.CreatedAt.Compare(b.CreatedAt); order != 0 {
+			return order
+		}
+		return strings.Compare(a.ID, b.ID)
+	})
+	return records, nil
+}
+
+// CloseSession deliberately archives id, releases its Agent connection, and
+// leaves the durable record available to Get and List.
+func (m *Manager) CloseSession(ctx context.Context, id string) (Record, error) {
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return Record{}, fmt.Errorf("close Session %q: %w", id, ErrClosed)
+	}
+	managed, ok := m.sessions[id]
+	if !ok {
+		m.mu.Unlock()
+		return Record{}, fmt.Errorf("close Session %q: %w", id, sql.ErrNoRows)
+	}
+	managed.mu.Lock()
+	m.mu.Unlock()
+	if !managed.record.State.CanTransitionTo(Closed) {
+		state := managed.record.State
+		managed.mu.Unlock()
+		return Record{}, fmt.Errorf("close Session %q from %q: %w", id, state, ErrInvalidTransition)
+	}
+
+	now := time.Now().UTC()
+	if _, err := m.db.ExecContext(ctx, `UPDATE sessions SET state = ?, last_activity_at = ? WHERE id = ?`, Closed, now.UnixNano(), id); err != nil {
+		managed.mu.Unlock()
+		return Record{}, fmt.Errorf("archive Session %q: %w", id, err)
+	}
+	conn := managed.conn
+	current := managed.current
+	if current != nil {
+		current.closed.Store(true)
+	}
+	pending := managed.queue
+	managed.queue = nil
+	for _, call := range pending {
+		call.closed.Store(true)
+	}
+	managed.conn = nil
+	managed.closing = true
+	m.stopIdleLocked(managed)
+	managed.record.State = Closed
+	managed.record.LastActivityAt = now
+	record := managed.record
+	managed.mu.Unlock()
+
+	for _, call := range pending {
+		call.result <- promptResult{err: ErrSessionClosed}
+		close(call.done)
+	}
+	var closeErr error
+	if conn != nil {
+		if err := closeAgent(conn); err != nil {
+			closeErr = err
+		}
+	}
+	if current != nil {
+		select {
+		case <-current.done:
+		case <-ctx.Done():
+			return record, errors.Join(closeErr, ctx.Err())
+		}
+	}
+	return record, closeErr
 }
 
 // Close drops pending work, closes live Agent connections, demotes every live
@@ -343,6 +632,7 @@ func (m *Manager) Close() error {
 	for _, managed := range m.sessions {
 		managed.mu.Lock()
 		managed.closing = true
+		m.stopIdleLocked(managed)
 		pending = append(pending, managed.queue...)
 		managed.queue = nil
 		if managed.conn != nil {
@@ -355,6 +645,7 @@ func (m *Manager) Close() error {
 
 	for _, call := range pending {
 		call.result <- promptResult{err: ErrClosed}
+		close(call.done)
 	}
 	var closeErr error
 	for _, conn := range connections {
@@ -372,7 +663,61 @@ func (m *Manager) Close() error {
 			managed.mu.Unlock()
 		}
 	}
-	return errors.Join(closeErr, closeDatabase(m.db))
+	m.mu.Lock()
+	backgroundErr := m.backgroundErr
+	m.mu.Unlock()
+	return errors.Join(closeErr, backgroundErr, closeDatabase(m.db))
+}
+
+func (m *Manager) armIdleLocked(id string, managed *managedSession) {
+	if m.idleTimeout == 0 || managed.closing || managed.record.State != Live || managed.conn == nil {
+		return
+	}
+	m.stopIdleLocked(managed)
+	managed.idleTimer = time.AfterFunc(m.idleTimeout, func() {
+		m.demoteIdle(id, managed)
+	})
+}
+
+func (m *Manager) stopIdleLocked(managed *managedSession) {
+	if managed.idleTimer != nil {
+		managed.idleTimer.Stop()
+		managed.idleTimer = nil
+	}
+}
+
+func (m *Manager) demoteIdle(id string, managed *managedSession) {
+	m.mu.Lock()
+	if m.closed || m.sessions[id] != managed {
+		m.mu.Unlock()
+		return
+	}
+	managed.mu.Lock()
+	managed.idleTimer = nil
+	if managed.working || len(managed.queue) != 0 || managed.record.State != Live || managed.conn == nil {
+		m.armIdleLocked(id, managed)
+		managed.mu.Unlock()
+		m.mu.Unlock()
+		return
+	}
+	if _, err := m.db.ExecContext(m.ctx, `UPDATE sessions SET state = ? WHERE id = ?`, Dormant, id); err != nil {
+		m.armIdleLocked(id, managed)
+		managed.mu.Unlock()
+		m.backgroundErr = errors.Join(m.backgroundErr, fmt.Errorf("demote idle Session %q: %w", id, err))
+		m.mu.Unlock()
+		return
+	}
+	conn := managed.conn
+	managed.conn = nil
+	managed.record.State = Dormant
+	managed.mu.Unlock()
+	m.mu.Unlock()
+
+	if err := closeAgent(conn); err != nil {
+		m.mu.Lock()
+		m.backgroundErr = errors.Join(m.backgroundErr, fmt.Errorf("demote idle Session %q: %w", id, err))
+		m.mu.Unlock()
+	}
 }
 
 func (m *Manager) load(ctx context.Context) (returnErr error) {
