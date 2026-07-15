@@ -1,0 +1,19 @@
+# OpenACP reference material — never enters aethos history (see docs/adr/0001)
+openacp-main/
+
+# Build artifacts
+/aethos
+dist/
+
+# Test and coverage output
+*.test
+*.out
+coverage.html
+
+# Local Go workspace state
+go.work
+go.work.sum
+
+# Editor and OS noise
+.DS_Store
+.claude/settings.local.json
