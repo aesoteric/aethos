@@ -54,7 +54,9 @@ type Paths struct {
 
 // Telegram holds configuration for the Telegram Channel.
 type Telegram struct {
-	BotToken string `toml:"bot_token"`
+	BotToken       string  `toml:"bot_token"`
+	ChatID         int64   `toml:"chat_id"`
+	AllowedUserIDs []int64 `toml:"allowed_user_ids"`
 }
 
 // Permissions configures the fail-safe deadline and exact Agent tool kinds
@@ -71,6 +73,25 @@ type Config struct {
 	IdleTimeout  Duration    `toml:"idle_timeout"`
 	Permissions  Permissions `toml:"permissions"`
 	Telegram     Telegram    `toml:"telegram"`
+}
+
+// ValidateTelegramAllowedUserIDs enforces the fail-closed Telegram access
+// policy shared by configuration, setup, and the running Channel.
+func ValidateTelegramAllowedUserIDs(userIDs []int64) error {
+	if len(userIDs) == 0 {
+		return fmt.Errorf("telegram.allowed_user_ids must contain at least one Telegram user ID")
+	}
+	seen := make(map[int64]struct{}, len(userIDs))
+	for _, userID := range userIDs {
+		if userID <= 0 {
+			return fmt.Errorf("telegram.allowed_user_ids contains invalid Telegram user ID %d", userID)
+		}
+		if _, duplicate := seen[userID]; duplicate {
+			return fmt.Errorf("telegram.allowed_user_ids contains duplicate Telegram user ID %d", userID)
+		}
+		seen[userID] = struct{}{}
+	}
+	return nil
 }
 
 // ResolveDataDir selects the data directory. An explicit flag wins over
@@ -167,6 +188,12 @@ func (c Config) Validate() error {
 	}
 	if strings.TrimSpace(c.DefaultAgent) == "" {
 		return fmt.Errorf("default_agent is required (set it in config.toml or %s)", defaultAgentEnv)
+	}
+	if c.Telegram.ChatID == 0 {
+		return fmt.Errorf("telegram.chat_id is required")
+	}
+	if err := ValidateTelegramAllowedUserIDs(c.Telegram.AllowedUserIDs); err != nil {
+		return err
 	}
 	if c.IdleTimeout <= 0 {
 		return fmt.Errorf("idle_timeout must be greater than zero")

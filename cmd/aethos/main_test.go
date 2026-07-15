@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -10,7 +11,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -117,6 +120,8 @@ idle_timeout = "never"
 
 [telegram]
 bot_token = "token"
+chat_id = -1001
+allowed_user_ids = [123]
 `
 	if err := os.WriteFile(configFile, []byte(contents), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -151,6 +156,8 @@ auto_approve = ["read", "search"]
 
 [telegram]
 bot_token = "token"
+chat_id = -1001
+allowed_user_ids = [123]
 `
 	if err := os.WriteFile(configFile, []byte(contents), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -194,62 +201,88 @@ bot_token = "token"
 	}
 }
 
-func TestRunFirstRunWritesConfigThenLaterRunBootsSilently(t *testing.T) {
+func TestRunFirstRunWritesConfigAndRunsTelegramChannelAcrossRestart(t *testing.T) {
 	unsetEnv(t, "AETHOS_DATA_DIR")
 	unsetEnv(t, "AETHOS_TELEGRAM_BOT_TOKEN")
 	unsetEnv(t, "AETHOS_WORKSPACE")
 	unsetEnv(t, "AETHOS_DEFAULT_AGENT")
 
+	var callsMu sync.Mutex
+	var calls []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/botvalid-token/getMe" {
-			http.NotFound(w, r)
+		method := strings.TrimPrefix(r.URL.Path, "/botvalid-token/")
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		callsMu.Lock()
+		calls = append(calls, method)
+		callsMu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"ok":true,"result":{"id":123,"is_bot":true,"first_name":"aethos"}}`)
+		switch method {
+		case "getMe":
+			fmt.Fprint(w, `{"ok":true,"result":{"id":123,"is_bot":true,"first_name":"aethos"}}`)
+		case "getChat":
+			fmt.Fprint(w, `{"ok":true,"result":{"id":-1001234567890,"type":"supergroup","title":"Aethos","is_forum":true}}`)
+		case "createForumTopic":
+			fmt.Fprint(w, `{"ok":true,"result":{"message_thread_id":101,"name":"Assistant"}}`)
+		case "sendMessage":
+			fmt.Fprint(w, `{"ok":true,"result":{"message_id":201,"chat":{"id":-1001234567890,"type":"supergroup"}}}`)
+		case "getUpdates":
+			<-r.Context().Done()
+		default:
+			http.NotFound(w, r)
+		}
 	}))
 	t.Cleanup(server.Close)
 
 	dataDir := filepath.Join(t.TempDir(), "data")
 	workspace := t.TempDir()
-	input := strings.NewReader("valid-token\n" + workspace + "\ncodex-acp\n")
+	input := strings.NewReader("valid-token\n-1001234567890\n123456789\n" + workspace + "\ncodex-acp\n")
 	var firstOutput strings.Builder
-	validator := telegram.NewClient(server.URL, server.Client())
+	client := telegram.NewClient(server.URL, server.Client())
 
-	err := run(
-		t.Context(),
-		slog.New(slog.DiscardHandler),
-		[]string{"-data-dir", dataDir},
-		input,
-		&firstOutput,
-		io.Discard,
-		validator,
-	)
-	if err != nil {
-		t.Fatalf("first run: %v", err)
-	}
+	firstCtx, firstCancel := context.WithCancel(t.Context())
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- run(firstCtx, slog.New(slog.DiscardHandler), []string{"-data-dir", dataDir}, input, &firstOutput, io.Discard, client)
+	}()
+	waitForRun(t, func() bool {
+		callsMu.Lock()
+		defer callsMu.Unlock()
+		return slices.Contains(calls, "getUpdates")
+	})
 	if !strings.Contains(firstOutput.String(), "Let's set up aethos") {
 		t.Errorf("first-run output = %q, want wizard", firstOutput.String())
 	}
 	if _, err := os.Stat(filepath.Join(dataDir, "config.toml")); err != nil {
 		t.Fatalf("first run did not create config.toml: %v", err)
 	}
+	firstCancel()
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first run: %v", err)
+	}
 
-	var laterOutput, laterErrors strings.Builder
-	err = run(
-		t.Context(),
-		slog.New(slog.DiscardHandler),
-		[]string{"-data-dir", dataDir},
-		strings.NewReader("this must not be read"),
-		&laterOutput,
-		&laterErrors,
-		nil,
-	)
-	if err != nil {
+	laterCtx, laterCancel := context.WithCancel(t.Context())
+	laterDone := make(chan error, 1)
+	go func() {
+		laterDone <- run(laterCtx, slog.New(slog.DiscardHandler), []string{"-data-dir", dataDir}, strings.NewReader("this must not be read"), io.Discard, io.Discard, client)
+	}()
+	waitForRun(t, func() bool {
+		callsMu.Lock()
+		defer callsMu.Unlock()
+		return countString(calls, "getUpdates") >= 2
+	})
+	laterCancel()
+	if err := <-laterDone; err != nil {
 		t.Fatalf("later run: %v", err)
 	}
-	if laterOutput.Len() != 0 || laterErrors.Len() != 0 {
-		t.Errorf("later run was not silent: stdout=%q stderr=%q", laterOutput.String(), laterErrors.String())
+	callsMu.Lock()
+	createdAssistant := countString(calls, "createForumTopic")
+	callsMu.Unlock()
+	if createdAssistant != 1 {
+		t.Errorf("Assistant Topic creations across restart = %d, want 1", createdAssistant)
 	}
 }
 
@@ -293,4 +326,32 @@ func unsetEnv(t *testing.T, key string) {
 			_ = os.Unsetenv(key)
 		}
 	})
+}
+
+func waitForRun(t *testing.T, condition func() bool) {
+	t.Helper()
+	deadline := time.NewTimer(3 * time.Second)
+	ticker := time.NewTicker(time.Millisecond)
+	defer deadline.Stop()
+	defer ticker.Stop()
+	for {
+		if condition() {
+			return
+		}
+		select {
+		case <-deadline.C:
+			t.Fatal("condition was not met before timeout")
+		case <-ticker.C:
+		}
+	}
+}
+
+func countString(values []string, want string) int {
+	count := 0
+	for _, value := range values {
+		if value == want {
+			count++
+		}
+	}
+	return count
 }

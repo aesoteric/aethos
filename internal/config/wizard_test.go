@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -37,7 +38,7 @@ func TestWizardRepromptsForRejectedTokenAndWritesCommentedConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPaths: %v", err)
 	}
-	input := strings.NewReader("bad-token\ngood-token\n" + workspace + "\ncodex-acp\n")
+	input := strings.NewReader("bad-token\ngood-token\n-1001234567890\n123456789, 987654321\n" + workspace + "\ncodex-acp\n")
 	var output strings.Builder
 
 	validator := telegram.NewClient(server.URL, server.Client())
@@ -58,12 +59,18 @@ func TestWizardRepromptsForRejectedTokenAndWritesCommentedConfig(t *testing.T) {
 	if got.Telegram.BotToken != "good-token" || got.Workspace != workspace || got.DefaultAgent != "codex-acp" {
 		t.Errorf("RunWizard config = %#v, want collected values", got)
 	}
+	if got.Telegram.ChatID != -1001234567890 {
+		t.Errorf("Telegram.ChatID = %d, want -1001234567890", got.Telegram.ChatID)
+	}
+	if want := []int64{123456789, 987654321}; !slices.Equal(got.Telegram.AllowedUserIDs, want) {
+		t.Errorf("Telegram.AllowedUserIDs = %v, want %v", got.Telegram.AllowedUserIDs, want)
+	}
 
 	written, err := os.ReadFile(paths.ConfigFile)
 	if err != nil {
 		t.Fatalf("read generated config: %v", err)
 	}
-	for _, comment := range []string{"# Workspace", "# Agent", "# permissions", "# Telegram", "AETHOS_TELEGRAM_BOT_TOKEN"} {
+	for _, comment := range []string{"# Workspace", "# Agent", "# permissions", "# Telegram", "allowlisted", "AETHOS_TELEGRAM_BOT_TOKEN"} {
 		if !strings.Contains(string(written), comment) {
 			t.Errorf("generated config does not contain explanatory comment %q:\n%s", comment, written)
 		}
@@ -93,7 +100,7 @@ func TestWizardDoesNotWriteEnvironmentBotTokenToDisk(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPaths: %v", err)
 	}
-	input := strings.NewReader(workspace + "\ncodex-acp\n")
+	input := strings.NewReader("-1001234567890\n123456789\n" + workspace + "\ncodex-acp\n")
 	var output strings.Builder
 
 	validator := telegram.NewClient(server.URL, server.Client())

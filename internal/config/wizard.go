@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/BurntSushi/toml"
@@ -40,6 +41,14 @@ func RunWizard(
 	if err != nil {
 		return Config{}, err
 	}
+	chatID, err := interaction.collectChatID()
+	if err != nil {
+		return Config{}, err
+	}
+	allowedUserIDs, err := interaction.collectAllowedUserIDs()
+	if err != nil {
+		return Config{}, err
+	}
 	workspace, err := interaction.collectWorkspace()
 	if err != nil {
 		return Config{}, err
@@ -53,6 +62,8 @@ func RunWizard(
 	effective.Workspace = workspace
 	effective.DefaultAgent = defaultAgent
 	effective.Telegram.BotToken = token
+	effective.Telegram.ChatID = chatID
+	effective.Telegram.AllowedUserIDs = allowedUserIDs
 	if err := effective.Validate(); err != nil {
 		return Config{}, fmt.Errorf("validate setup: %w", err)
 	}
@@ -76,6 +87,51 @@ func RunWizard(
 type wizardInteraction struct {
 	reader *bufio.Reader
 	output io.Writer
+}
+
+func (i wizardInteraction) collectChatID() (int64, error) {
+	for {
+		value, err := i.prompt("Telegram forum group ID: ")
+		if err != nil {
+			return 0, err
+		}
+		chatID, err := strconv.ParseInt(value, 10, 64)
+		if err != nil || chatID >= 0 {
+			fmt.Fprintln(i.output, "A Telegram forum group ID must be a negative integer, such as -1001234567890.")
+			continue
+		}
+		return chatID, nil
+	}
+}
+
+func (i wizardInteraction) collectAllowedUserIDs() ([]int64, error) {
+	for {
+		value, err := i.prompt("Allowed Telegram user IDs (comma-separated): ")
+		if err != nil {
+			return nil, err
+		}
+		fields := strings.FieldsFunc(value, func(r rune) bool {
+			return r == ',' || r == ' ' || r == '\t'
+		})
+		userIDs := make([]int64, 0, len(fields))
+		valid := len(fields) > 0
+		for _, field := range fields {
+			userID, parseErr := strconv.ParseInt(field, 10, 64)
+			if parseErr != nil {
+				valid = false
+				break
+			}
+			userIDs = append(userIDs, userID)
+		}
+		if valid && ValidateTelegramAllowedUserIDs(userIDs) != nil {
+			valid = false
+		}
+		if !valid {
+			fmt.Fprintln(i.output, "Enter one or more unique positive Telegram user IDs.")
+			continue
+		}
+		return userIDs, nil
+	}
 }
 
 func (i wizardInteraction) collectToken(
@@ -205,6 +261,8 @@ func writeCommentedConfig(paths Paths, cfg Config) error {
 # other secret-managed deployments, leave it empty and set
 # AETHOS_TELEGRAM_BOT_TOKEN instead. AETHOS_WORKSPACE and
 # AETHOS_DEFAULT_AGENT also override their corresponding values in this file.
+# chat_id selects the Telegram forum supergroup. Only the allowlisted Telegram
+# user IDs may interact with aethos; keep this list as small as possible.
 
 `)
 	if err := toml.NewEncoder(&contents).Encode(cfg); err != nil {

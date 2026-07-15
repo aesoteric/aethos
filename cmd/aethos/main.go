@@ -75,7 +75,7 @@ func run(
 	args []string,
 	stdin io.Reader,
 	stdout, stderr io.Writer,
-	tokenValidator config.TokenValidator,
+	telegramClient *telegram.Client,
 ) error {
 	if len(args) >= 2 && args[0] == "dev" && args[1] == "prompt" {
 		return devPrompt(ctx, logger, args[2:], stdout, stderr)
@@ -102,20 +102,62 @@ func run(
 		return err
 	}
 
+	var configured config.Config
 	_, err = os.Stat(paths.ConfigFile)
 	switch {
 	case err == nil:
-		_, err := config.Load(paths.ConfigFile)
-		return err
+		configured, err = config.Load(paths.ConfigFile)
+		if err != nil {
+			return err
+		}
 	case errors.Is(err, os.ErrNotExist):
-		if tokenValidator == nil {
+		if telegramClient == nil {
 			return fmt.Errorf("start first-run setup: Telegram token validator is unavailable")
 		}
-		_, err := config.RunWizard(ctx, stdin, stdout, paths, tokenValidator)
-		return err
+		configured, err = config.RunWizard(ctx, stdin, stdout, paths, telegramClient)
+		if err != nil {
+			return err
+		}
 	default:
 		return fmt.Errorf("inspect config %q: %w", paths.ConfigFile, err)
 	}
+	if telegramClient == nil {
+		return fmt.Errorf("start Telegram Channel: client is unavailable")
+	}
+	if err := os.MkdirAll(paths.DataDir, 0o700); err != nil {
+		return fmt.Errorf("create data directory %q: %w", paths.DataDir, err)
+	}
+
+	bridge, err := telegram.Open(
+		ctx,
+		paths.DatabaseFile,
+		telegramClient,
+		logger,
+		telegram.Settings{
+			Token:          configured.Telegram.BotToken,
+			ChatID:         configured.Telegram.ChatID,
+			AllowedUserIDs: configured.Telegram.AllowedUserIDs,
+			DefaultAgent:   configured.DefaultAgent,
+			Workspace:      configured.Workspace,
+		},
+	)
+	if err != nil {
+		return err
+	}
+	manager, err := session.Open(
+		ctx,
+		paths.DatabaseFile,
+		agentConnector(logger),
+		bridge,
+		session.WithIdleTimeout(time.Duration(configured.IdleTimeout)),
+		session.WithPermissionTimeout(time.Duration(configured.Permissions.Timeout)),
+		session.WithAutoApprove(configured.Permissions.AutoApprove...),
+	)
+	if err != nil {
+		return errors.Join(err, bridge.Close())
+	}
+	runErr := bridge.Run(ctx, manager)
+	return errors.Join(runErr, manager.Close(), bridge.Close())
 }
 
 // devPrompt is the hidden tracer-bullet command: spawn a locally

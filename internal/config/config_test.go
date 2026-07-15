@@ -98,6 +98,54 @@ func TestLoadReadsFixtureAndAppliesEnvironmentOverrides(t *testing.T) {
 	if time.Duration(got.IdleTimeout) != 45*time.Minute {
 		t.Errorf("IdleTimeout = %s, want 45m", time.Duration(got.IdleTimeout))
 	}
+	if got.Telegram.ChatID != -1001234567890 {
+		t.Errorf("Telegram.ChatID = %d, want -1001234567890", got.Telegram.ChatID)
+	}
+	if want := []int64{123456789, 987654321}; !slices.Equal(got.Telegram.AllowedUserIDs, want) {
+		t.Errorf("Telegram.AllowedUserIDs = %v, want %v", got.Telegram.AllowedUserIDs, want)
+	}
+}
+
+func TestLoadRequiresTelegramForumAndAllowlist(t *testing.T) {
+	tests := []struct {
+		name      string
+		telegram  string
+		wantError string
+	}{
+		{
+			name:      "missing forum group",
+			telegram:  "allowed_user_ids = [123]",
+			wantError: "telegram.chat_id",
+		},
+		{
+			name:      "empty allowlist",
+			telegram:  "chat_id = -1001234567890",
+			wantError: "telegram.allowed_user_ids",
+		},
+		{
+			name: "duplicate allowlisted user",
+			telegram: `chat_id = -1001234567890
+allowed_user_ids = [123, 123]`,
+			wantError: "duplicate Telegram user ID",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			writeFixture(t, path, `workspace = "/workspace"
+default_agent = "codex-acp"
+
+[telegram]
+bot_token = "token"
+`+tt.telegram+"\n")
+
+			_, err := config.Load(path)
+			if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("Load error = %v, want it to contain %q", err, tt.wantError)
+			}
+		})
+	}
 }
 
 func TestLoadDefaultsAndValidatesIdleTimeout(t *testing.T) {
@@ -106,7 +154,7 @@ func TestLoadDefaultsAndValidatesIdleTimeout(t *testing.T) {
 	t.Setenv("AETHOS_DEFAULT_AGENT", "codex-acp")
 
 	path := filepath.Join(t.TempDir(), "config.toml")
-	writeFixture(t, path, "[telegram]\nbot_token = \"\"\n")
+	writeFixture(t, path, "[telegram]\nbot_token = \"\"\nchat_id = -1001\nallowed_user_ids = [123]\n")
 	got, err := config.Load(path)
 	if err != nil {
 		t.Fatalf("Load default idle timeout: %v", err)
@@ -118,7 +166,7 @@ func TestLoadDefaultsAndValidatesIdleTimeout(t *testing.T) {
 		t.Errorf("Permissions.Timeout = %s, want default 10m", time.Duration(got.Permissions.Timeout))
 	}
 
-	writeFixture(t, path, "idle_timeout = \"never\"\n[telegram]\nbot_token = \"\"\n")
+	writeFixture(t, path, "idle_timeout = \"never\"\n[telegram]\nbot_token = \"\"\nchat_id = -1001\nallowed_user_ids = [123]\n")
 	if _, err := config.Load(path); err == nil || !strings.Contains(err.Error(), "idle_timeout") {
 		t.Errorf("Load invalid idle timeout error = %v, want actionable idle_timeout error", err)
 	}
@@ -135,6 +183,8 @@ auto_approve = ["read", "search"]
 
 [telegram]
 bot_token = "token"
+chat_id = -1001
+allowed_user_ids = [123]
 `)
 
 	got, err := config.Load(path)
@@ -156,6 +206,8 @@ timeout = "0s"
 
 [telegram]
 bot_token = "token"
+chat_id = -1001
+allowed_user_ids = [123]
 `)
 	if _, err := config.Load(path); err == nil || !strings.Contains(err.Error(), "permissions.timeout") {
 		t.Errorf("Load invalid permission timeout error = %v, want actionable permissions.timeout error", err)
@@ -171,6 +223,8 @@ default_agent = "codex-acp"
 
 [telegram]
 bot_token = ""
+chat_id = -1001
+allowed_user_ids = [123]
 `)
 
 	got, err := config.Load(path)

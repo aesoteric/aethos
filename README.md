@@ -29,9 +29,21 @@ The domain glossary lives in [CONTEXT.md](CONTEXT.md); code and review use its v
 ## Configuration
 
 Run `aethos` with no command. If `config.toml` does not exist, the first-run
-wizard validates the Telegram bot token with Telegram, collects a Workspace and
-default Agent command, and writes a commented configuration file. Later starts
-load that file without prompting.
+wizard validates the Telegram bot token with Telegram, collects the forum
+supergroup and allowlisted user IDs, a Workspace, and the default Agent command,
+then writes a commented configuration file and starts the Telegram Channel.
+Later starts load that file without prompting.
+
+The Telegram group must be a supergroup with Topics enabled. Add the bot as an
+administrator with permission to manage Topics, then give the wizard the
+negative group ID (usually beginning with `-100`) and the numeric Telegram user
+IDs that may use aethos. Messages from every other user are rejected and logged.
+
+At startup, aethos creates or reuses the Assistant Topic and posts its status.
+Send `/new` there to use the configured defaults, or
+`/new /absolute/workspace | agent command` to choose both. The new Session gets
+its own Topic; its first Prompt becomes the Session and Topic name. Plain
+messages sent to General are redirected to Assistant.
 
 The data directory defaults to `~/.aethos/`. Override it with
 `aethos -data-dir /path/to/data` or `AETHOS_DATA_DIR`; configuration, database,

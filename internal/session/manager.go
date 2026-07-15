@@ -58,14 +58,17 @@ type Create struct {
 	Agent     string
 	Workspace string
 	Owner     Owner
+	TopicID   int64
 }
 
 // Record is the durable, caller-visible state of a Session.
 type Record struct {
 	ID             string
+	Name           string
 	Agent          string
 	Workspace      string
 	Owner          Owner
+	TopicID        int64
 	State          State
 	CreatedAt      time.Time
 	LastActivityAt time.Time
@@ -273,6 +276,7 @@ func (m *Manager) Create(ctx context.Context, create Create) (Record, error) {
 		Agent:          create.Agent,
 		Workspace:      create.Workspace,
 		Owner:          create.Owner,
+		TopicID:        create.TopicID,
 		State:          Live,
 		CreatedAt:      now,
 		LastActivityAt: now,
@@ -590,6 +594,54 @@ func (m *Manager) Get(_ context.Context, id string) (Record, error) {
 	return managed.record, nil
 }
 
+// FindByTopic returns the Session durably bound to a Telegram Topic.
+func (m *Manager) FindByTopic(_ context.Context, topicID int64) (Record, error) {
+	if topicID <= 0 {
+		return Record{}, fmt.Errorf("find Session for Topic %d: %w", topicID, sql.ErrNoRows)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, managed := range m.sessions {
+		managed.mu.Lock()
+		if managed.record.TopicID == topicID {
+			record := managed.record
+			managed.mu.Unlock()
+			return record, nil
+		}
+		managed.mu.Unlock()
+	}
+	return Record{}, fmt.Errorf("find Session for Topic %d: %w", topicID, sql.ErrNoRows)
+}
+
+// Rename records the user-visible name derived from a Session's first Prompt.
+func (m *Manager) Rename(ctx context.Context, id, name string) (Record, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return Record{}, fmt.Errorf("rename Session %q: name is required", id)
+	}
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return Record{}, fmt.Errorf("rename Session %q: %w", id, ErrClosed)
+	}
+	managed, ok := m.sessions[id]
+	if !ok {
+		m.mu.Unlock()
+		return Record{}, fmt.Errorf("rename Session %q: %w", id, sql.ErrNoRows)
+	}
+	managed.mu.Lock()
+	m.mu.Unlock()
+	defer managed.mu.Unlock()
+	if managed.record.State == Closed {
+		return Record{}, fmt.Errorf("rename Session %q: %w", id, ErrSessionClosed)
+	}
+	if _, err := m.db.ExecContext(ctx, `UPDATE sessions SET name = ? WHERE id = ?`, name, id); err != nil {
+		return Record{}, fmt.Errorf("rename Session %q: %w", id, err)
+	}
+	managed.record.Name = name
+	return managed.record, nil
+}
+
 // List returns every Session, including archived Sessions, in creation order.
 func (m *Manager) List(_ context.Context) ([]Record, error) {
 	m.mu.Lock()
@@ -790,8 +842,8 @@ func (m *Manager) load(ctx context.Context) (returnErr error) {
 		return fmt.Errorf("recover live Sessions: %w", err)
 	}
 	rows, err := m.db.QueryContext(ctx, `
-		SELECT id, agent_session_id, agent, workspace, owner_channel, owner_id,
-		       state, created_at, last_activity_at
+		SELECT id, name, agent_session_id, agent, workspace, owner_channel, owner_id,
+		       topic_id, state, created_at, last_activity_at
 		FROM sessions`)
 	if err != nil {
 		return fmt.Errorf("load Sessions: %w", err)
@@ -804,11 +856,13 @@ func (m *Manager) load(ctx context.Context) (returnErr error) {
 		var createdAt, lastActivityAt int64
 		if err := rows.Scan(
 			&managed.record.ID,
+			&managed.record.Name,
 			&managed.agentSessionID,
 			&managed.record.Agent,
 			&managed.record.Workspace,
 			&managed.record.Owner.Channel,
 			&managed.record.Owner.ID,
+			&managed.record.TopicID,
 			&state,
 			&createdAt,
 			&lastActivityAt,
@@ -835,6 +889,9 @@ func validateCreate(create Create) error {
 	}
 	if strings.TrimSpace(create.Owner.Channel) == "" || strings.TrimSpace(create.Owner.ID) == "" {
 		return fmt.Errorf("owner identity requires a Channel and ID")
+	}
+	if create.TopicID < 0 {
+		return fmt.Errorf("topic ID cannot be negative")
 	}
 	return nil
 }

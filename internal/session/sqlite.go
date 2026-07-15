@@ -21,6 +21,9 @@ var migrations = []string{
 		created_at INTEGER NOT NULL,
 		last_activity_at INTEGER NOT NULL
 	) STRICT;`,
+	`ALTER TABLE sessions ADD COLUMN name TEXT NOT NULL DEFAULT '';
+	 ALTER TABLE sessions ADD COLUMN topic_id INTEGER NOT NULL DEFAULT 0;
+	 CREATE UNIQUE INDEX sessions_topic_id ON sessions(topic_id) WHERE topic_id != 0;`,
 }
 
 func openDatabase(ctx context.Context, path string) (*sql.DB, error) {
@@ -76,15 +79,17 @@ func migrate(ctx context.Context, db *sql.DB) (returnErr error) {
 func insertRecord(ctx context.Context, db *sql.DB, record Record, agentSessionID string) error {
 	_, err := db.ExecContext(ctx, `
 		INSERT INTO sessions (
-			id, agent_session_id, agent, workspace, owner_channel, owner_id,
-			state, created_at, last_activity_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			id, name, agent_session_id, agent, workspace, owner_channel, owner_id,
+			topic_id, state, created_at, last_activity_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		record.ID,
+		record.Name,
 		agentSessionID,
 		record.Agent,
 		record.Workspace,
 		record.Owner.Channel,
 		record.Owner.ID,
+		record.TopicID,
 		record.State,
 		record.CreatedAt.UnixNano(),
 		record.LastActivityAt.UnixNano(),
