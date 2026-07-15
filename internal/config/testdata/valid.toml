@@ -1,0 +1,9 @@
+# Directory made available to Sessions by default.
+workspace = "/srv/aethos-workspace"
+
+# Command used to start the default Agent.
+default_agent = "npx @zed-industries/claude-code-acp"
+
+# Token used by the Telegram Channel.
+[telegram]
+bot_token = "file-token"

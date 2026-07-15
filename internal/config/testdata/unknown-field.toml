@@ -1,0 +1,6 @@
+workspace = "/srv/aethos-workspace"
+default_agent = "codex-acp"
+surprise = true
+
+[telegram]
+bot_token = "file-token"

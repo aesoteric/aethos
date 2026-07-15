@@ -1,0 +1,4 @@
+default_agent = "codex-acp"
+
+[telegram]
+bot_token = "file-token"

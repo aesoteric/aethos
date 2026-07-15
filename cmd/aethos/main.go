@@ -9,21 +9,28 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/aesoteric/aethos/internal/agent"
+	"github.com/aesoteric/aethos/internal/config"
 	"github.com/aesoteric/aethos/internal/session"
+	"github.com/aesoteric/aethos/internal/telegram"
 )
 
 // usage deliberately omits the hidden dev command.
 const usage = `aethos — self-hosted bridge from ACP coding agents to messaging platforms
 
-No user-facing commands are available yet; the first release is under
-construction. See https://github.com/aesoteric/aethos.
+usage: aethos [-data-dir <directory>]
+
+On first run, aethos creates a commented config.toml with an interactive
+setup wizard. The data directory defaults to ~/.aethos and can also be set
+with AETHOS_DATA_DIR.
 `
 
 // errUsage signals that usage help was printed and no further error
@@ -35,7 +42,8 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	err := run(ctx, logger, os.Args[1:], os.Stdout, os.Stderr)
+	telegramClient := telegram.NewClient(telegram.APIBaseURL, &http.Client{Timeout: 15 * time.Second})
+	err := run(ctx, logger, os.Args[1:], os.Stdin, os.Stdout, os.Stderr, telegramClient)
 	switch {
 	case errors.Is(err, errUsage):
 		os.Exit(2)
@@ -61,12 +69,53 @@ func newLogger(w io.Writer) *slog.Logger {
 	return logger
 }
 
-func run(ctx context.Context, logger *slog.Logger, args []string, stdout, stderr io.Writer) error {
+func run(
+	ctx context.Context,
+	logger *slog.Logger,
+	args []string,
+	stdin io.Reader,
+	stdout, stderr io.Writer,
+	tokenValidator config.TokenValidator,
+) error {
 	if len(args) >= 2 && args[0] == "dev" && args[1] == "prompt" {
 		return devPrompt(ctx, logger, args[2:], stdout, stderr)
 	}
-	fmt.Fprint(stderr, usage)
-	return errUsage
+
+	fs := flag.NewFlagSet("aethos", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	fs.Usage = func() { fmt.Fprint(stderr, usage) }
+	dataDirFlag := fs.String("data-dir", "", "directory containing aethos config, database, and logs")
+	if err := fs.Parse(args); err != nil {
+		return errUsage
+	}
+	if fs.NArg() != 0 {
+		fs.Usage()
+		return errUsage
+	}
+
+	dataDir, err := config.ResolveDataDir(*dataDirFlag)
+	if err != nil {
+		return err
+	}
+	paths, err := config.NewPaths(dataDir)
+	if err != nil {
+		return err
+	}
+
+	_, err = os.Stat(paths.ConfigFile)
+	switch {
+	case err == nil:
+		_, err := config.Load(paths.ConfigFile)
+		return err
+	case errors.Is(err, os.ErrNotExist):
+		if tokenValidator == nil {
+			return fmt.Errorf("start first-run setup: Telegram token validator is unavailable")
+		}
+		_, err := config.RunWizard(ctx, stdin, stdout, paths, tokenValidator)
+		return err
+	default:
+		return fmt.Errorf("inspect config %q: %w", paths.ConfigFile, err)
+	}
 }
 
 // devPrompt is the hidden tracer-bullet command: spawn a locally

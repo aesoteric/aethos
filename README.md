@@ -26,6 +26,24 @@ Coding agents are locked to terminal REPLs and IDE integrations. aethos lets you
 
 The domain glossary lives in [CONTEXT.md](CONTEXT.md); code and review use its vocabulary exactly.
 
+## Configuration
+
+Run `aethos` with no command. If `config.toml` does not exist, the first-run
+wizard validates the Telegram bot token with Telegram, collects a Workspace and
+default Agent command, and writes a commented configuration file. Later starts
+load that file without prompting.
+
+The data directory defaults to `~/.aethos/`. Override it with
+`aethos -data-dir /path/to/data` or `AETHOS_DATA_DIR`; configuration, database,
+and log paths are all rooted there. Environment values override the file:
+
+- `AETHOS_TELEGRAM_BOT_TOKEN` (keeps the token out of `config.toml`)
+- `AETHOS_WORKSPACE`
+- `AETHOS_DEFAULT_AGENT`
+
+Invalid TOML, unknown fields, and missing required values stop startup with an
+actionable error.
+
 ## Development
 
 Requires Go 1.24+.
