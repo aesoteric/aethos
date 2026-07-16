@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aesoteric/aethos/internal/agent"
@@ -46,9 +47,18 @@ type Gate struct {
 	issued   uint64
 }
 
+// Result contains the Agent-facing decision and the presentation state a
+// Channel needs to finish a surfaced permission request.
+type Result struct {
+	RequestID string
+	Decision  agent.PermissionDecision
+	Presented bool
+	TimedOut  bool
+}
+
 type pendingRequest struct {
 	options []agent.PermissionOption
-	done    chan agent.PermissionDecision
+	done    chan Result
 }
 
 // New constructs a Gate. autoApprove contains exact Agent tool kinds, such as
@@ -77,16 +87,16 @@ func New(timeout time.Duration, autoApprove []string, present Present, report Re
 // Request applies auto-approve rules or pauses until the Channel resolves the
 // request. Context cancellation cancels the ACP request rather than selecting
 // an option the user did not choose.
-func (g *Gate) Request(ctx context.Context, sessionID string, request agent.PermissionRequest) (agent.PermissionDecision, error) {
+func (g *Gate) Request(ctx context.Context, sessionID string, request agent.PermissionRequest) (Result, error) {
 	if slices.Contains(g.autoApprove, request.Kind) {
 		if option, ok := optionByDisposition(request.Options, true); ok {
-			return agent.PermissionDecision{OptionID: option.ID}, nil
+			return Result{Decision: agent.PermissionDecision{OptionID: option.ID}}, nil
 		}
 	}
 
 	pending := &pendingRequest{
 		options: append([]agent.PermissionOption(nil), request.Options...),
-		done:    make(chan agent.PermissionDecision, 1),
+		done:    make(chan Result, 1),
 	}
 	g.mu.Lock()
 	g.issued++
@@ -101,26 +111,38 @@ func (g *Gate) Request(ctx context.Context, sessionID string, request agent.Perm
 	presentCtx, cancelPresent := context.WithCancel(ctx)
 	defer cancelPresent()
 	presented := make(chan error, 1)
+	var presentationSucceeded atomic.Bool
 	go func() {
-		presented <- g.present(presentCtx, sessionID, requested)
+		err := g.present(presentCtx, sessionID, requested)
+		if err == nil {
+			presentationSucceeded.Store(true)
+		}
+		presented <- err
 	}()
 
 	for {
 		select {
-		case response := <-pending.done:
-			return response, nil
+		case result := <-pending.done:
+			return result, nil
 		case err := <-presented:
 			if err != nil {
 				g.reportError(fmt.Errorf("present permission request %q for Session %q: %w", id, sessionID, err))
-				g.finish(id, failSafeDecision(request.Options))
+				g.finish(id, Result{Decision: failSafeDecision(request.Options)})
 				return <-pending.done, nil
 			}
 			presented = nil
 		case <-timer.C:
-			g.finish(id, failSafeDecision(request.Options))
+			g.finish(id, Result{
+				Decision:  failSafeDecision(request.Options),
+				Presented: presentationSucceeded.Load(),
+				TimedOut:  true,
+			})
 			return <-pending.done, nil
 		case <-ctx.Done():
-			g.finish(id, agent.PermissionDecision{Cancelled: true})
+			g.finish(id, Result{
+				Decision:  agent.PermissionDecision{Cancelled: true},
+				Presented: presentationSucceeded.Load(),
+			})
 			return <-pending.done, nil
 		}
 	}
@@ -143,23 +165,27 @@ func (g *Gate) Resolve(requestID, optionID string) error {
 	}) {
 		return fmt.Errorf("resolve permission %q with option %q: %w", requestID, optionID, ErrUnknownOption)
 	}
-	g.finishLocked(requestID, pending, agent.PermissionDecision{OptionID: optionID})
+	g.finishLocked(requestID, pending, Result{
+		Decision:  agent.PermissionDecision{OptionID: optionID},
+		Presented: true,
+	})
 	return nil
 }
 
-func (g *Gate) finish(requestID string, response agent.PermissionDecision) {
+func (g *Gate) finish(requestID string, result Result) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	pending, ok := g.pending[requestID]
 	if !ok {
 		return
 	}
-	g.finishLocked(requestID, pending, response)
+	g.finishLocked(requestID, pending, result)
 }
 
-func (g *Gate) finishLocked(requestID string, pending *pendingRequest, response agent.PermissionDecision) {
+func (g *Gate) finishLocked(requestID string, pending *pendingRequest, result Result) {
 	delete(g.pending, requestID)
-	pending.done <- response
+	result.RequestID = requestID
+	pending.done <- result
 }
 
 func (g *Gate) wasIssuedLocked(requestID string) bool {

@@ -1,0 +1,16 @@
+{
+  "ok": true,
+  "result": [
+    {
+      "update_id": 20,
+      "message": {
+        "message_id": 31,
+        "message_thread_id": 303,
+        "is_topic_message": true,
+        "from": {"id": 123456789, "first_name": "Alice"},
+        "chat": {"id": -1001234567890, "type": "supergroup", "is_forum": true},
+        "text": "update the config"
+      }
+    }
+  ]
+}

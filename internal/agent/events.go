@@ -66,6 +66,15 @@ type PermissionRequested struct {
 	PermissionRequest
 }
 
+// PermissionResolved reports the terminal outcome of a surfaced permission
+// request so Channels can remove stale controls and show what happened.
+type PermissionResolved struct {
+	ID        string
+	OptionID  string
+	TimedOut  bool
+	Cancelled bool
+}
+
 // PermissionDecision is the outcome returned to the Agent. A cancelled
 // response is used when the surrounding Prompt ends before a user answers.
 type PermissionDecision struct {
@@ -82,6 +91,7 @@ func (Message) isEvent()             {}
 func (ToolCallBegan) isEvent()       {}
 func (ToolCallProgressed) isEvent()  {}
 func (PermissionRequested) isEvent() {}
+func (PermissionResolved) isEvent()  {}
 func (Crashed) isEvent()             {}
 
 // EventHandler receives every translated Event of a Conn in arrival order,

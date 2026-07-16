@@ -23,9 +23,11 @@ import (
 )
 
 const (
-	assistantTopicName  = "Assistant"
-	newSessionTopicName = "New Session"
-	telegramTextLimit   = 4000
+	assistantTopicName           = "Assistant"
+	newSessionTopicName          = "New Session"
+	telegramTextLimit            = 4000
+	permissionCallbackPrefix     = "permission:"
+	completedPermissionRetention = 10 * time.Minute
 )
 
 // Settings contains the Telegram and default Session values needed by the
@@ -73,9 +75,13 @@ func WithPollTimeout(timeout time.Duration) Option {
 type sessionTarget interface {
 	Create(context.Context, session.Create) (session.Record, error)
 	Prompt(context.Context, string, string) (agent.StopReason, error)
+	Cancel(context.Context, string) error
+	ResolvePermission(context.Context, string, string) error
 	Get(context.Context, string) (session.Record, error)
 	FindByTopic(context.Context, int64) (session.Record, error)
 	Rename(context.Context, string, string) (session.Record, error)
+	List(context.Context) ([]session.Record, error)
+	CloseSession(context.Context, string) (session.Record, error)
 }
 
 // Channel translates Telegram updates into Session operations and streams
@@ -92,6 +98,7 @@ type Channel struct {
 	sessions         sessionTarget
 	assistantTopicID int64
 	drafts           map[string]*messageDraft
+	permissions      map[string]*permissionMessage
 	lanes            map[int64]chan inboundPrompt
 	running          bool
 	closed           bool
@@ -103,6 +110,14 @@ type inboundPrompt struct {
 	sessionID string
 	topicID   int64
 	text      string
+}
+
+type permissionMessage struct {
+	messageID   int64
+	topicID     int64
+	title       string
+	options     []agent.PermissionOption
+	completedAt time.Time
 }
 
 type messageDraft struct {
@@ -196,14 +211,15 @@ func Open(
 	}
 
 	channel := &Channel{
-		client:   client,
-		settings: settings,
-		logger:   logger,
-		db:       db,
-		options:  options,
-		allowed:  allowed,
-		drafts:   make(map[string]*messageDraft),
-		lanes:    make(map[int64]chan inboundPrompt),
+		client:      client,
+		settings:    settings,
+		logger:      logger,
+		db:          db,
+		options:     options,
+		allowed:     allowed,
+		drafts:      make(map[string]*messageDraft),
+		permissions: make(map[string]*permissionMessage),
+		lanes:       make(map[int64]chan inboundPrompt),
 	}
 	err = db.QueryRowContext(ctx, `SELECT value FROM telegram_state WHERE key = 'assistant_topic_id'`).Scan(&channel.assistantTopicID)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -307,7 +323,7 @@ func (c *Channel) bootstrapAssistant(ctx context.Context) error {
 		c.assistantTopicID = topicID
 		c.mu.Unlock()
 	}
-	status := "aethos is online. Send /new to use the default Agent and Workspace, or /new <Workspace> | <Agent command> to choose both."
+	status := "aethos is online. Send /new to create a Session, or /sessions to list and close Sessions."
 	if _, err := c.client.sendMessage(ctx, c.settings.Token, c.settings.ChatID, topicID, status); err != nil {
 		return fmt.Errorf("post Assistant status: %w", err)
 	}
@@ -315,6 +331,9 @@ func (c *Channel) bootstrapAssistant(ctx context.Context) error {
 }
 
 func (c *Channel) handleUpdate(ctx context.Context, one update) error {
+	if one.CallbackQuery != nil {
+		return c.handleCallback(ctx, one.CallbackQuery)
+	}
 	message := one.Message
 	if message == nil {
 		return nil
@@ -360,6 +379,10 @@ func (c *Channel) handleUpdate(ctx context.Context, one update) error {
 		if err != nil {
 			return err
 		}
+		command, _ := telegramCommand(message.Text)
+		if command == "/cancel" {
+			return c.cancelPrompt(ctx, record)
+		}
 		return c.enqueuePrompt(ctx, inboundPrompt{
 			sessionID: record.ID,
 			topicID:   record.TopicID,
@@ -368,14 +391,117 @@ func (c *Channel) handleUpdate(ctx context.Context, one update) error {
 	}
 }
 
-func (c *Channel) handleAssistant(ctx context.Context, message *message) error {
-	command, argument, _ := strings.Cut(strings.TrimSpace(message.Text), " ")
+func (c *Channel) handleCallback(ctx context.Context, query *callbackQuery) (returnErr error) {
+	answer := ""
+	defer func() {
+		if query.ID == "" {
+			return
+		}
+		returnErr = errors.Join(returnErr, c.client.answerCallbackQuery(
+			ctx,
+			c.settings.Token,
+			query.ID,
+			answer,
+		))
+	}()
+
+	if query.From == nil || query.Message == nil || query.Message.Chat.ID != c.settings.ChatID {
+		answer = "This action is not available."
+		return nil
+	}
+	if _, ok := c.allowed[query.From.ID]; !ok {
+		c.logger.Warn("rejected non-allowlisted Telegram callback", "telegram_user_id", query.From.ID)
+		answer = "You are not allowed to use this control."
+		return nil
+	}
+	requestID, optionIndex, err := parsePermissionCallback(query.Data)
+	if err != nil {
+		answer = "This action is no longer available."
+		return nil
+	}
+
+	c.mu.Lock()
+	pending := c.permissions[requestID]
+	sessions := c.sessions
+	if pending == nil || pending.messageID != query.Message.MessageID ||
+		pending.topicID != query.Message.MessageThreadID || optionIndex >= len(pending.options) {
+		c.mu.Unlock()
+		answer = "This action is no longer available."
+		return nil
+	}
+	optionID := pending.options[optionIndex].ID
+	c.mu.Unlock()
+	if sessions == nil {
+		answer = "aethos is not ready."
+		return nil
+	}
+	if err := sessions.ResolvePermission(ctx, requestID, optionID); err != nil {
+		answer = "The permission response could not be recorded."
+		return err
+	}
+	answer = "Permission response recorded."
+	return nil
+}
+
+func parsePermissionCallback(data string) (string, int, error) {
+	payload, ok := strings.CutPrefix(data, permissionCallbackPrefix)
+	if !ok {
+		return "", 0, fmt.Errorf("unknown Telegram callback")
+	}
+	requestID, rawIndex, ok := strings.Cut(payload, ":")
+	if !ok || requestID == "" {
+		return "", 0, fmt.Errorf("invalid Telegram permission callback")
+	}
+	index, err := strconv.Atoi(rawIndex)
+	if err != nil || index < 0 {
+		return "", 0, fmt.Errorf("invalid Telegram permission option index")
+	}
+	return requestID, index, nil
+}
+
+func (c *Channel) cancelPrompt(ctx context.Context, record session.Record) error {
+	if err := c.sessions.Cancel(ctx, record.ID); err != nil {
+		if errors.Is(err, session.ErrNoPrompt) {
+			_, sendErr := c.client.sendMessage(
+				ctx,
+				c.settings.Token,
+				c.settings.ChatID,
+				record.TopicID,
+				"No Prompt is currently running.",
+			)
+			return sendErr
+		}
+		return err
+	}
+	_, err := c.client.sendMessage(
+		ctx,
+		c.settings.Token,
+		c.settings.ChatID,
+		record.TopicID,
+		"Prompt cancelled.",
+	)
+	return err
+}
+
+func telegramCommand(text string) (string, string) {
+	command, argument, _ := strings.Cut(strings.TrimSpace(text), " ")
 	if name, _, found := strings.Cut(command, "@"); found {
 		command = name
 	}
-	if command != "/new" {
+	return command, strings.TrimSpace(argument)
+}
+
+func (c *Channel) handleAssistant(ctx context.Context, message *message) error {
+	command, argument := telegramCommand(message.Text)
+	switch command {
+	case "/sessions":
+		return c.sendSessionList(ctx)
+	case "/close":
+		return c.closeSession(ctx, argument)
+	case "/new":
+	default:
 		_, err := c.client.sendMessage(ctx, c.settings.Token, c.settings.ChatID, c.assistantTopicID,
-			"Send /new, or /new <Workspace> | <Agent command>, to create a Session.")
+			"Send /new to create a Session, /sessions to list Sessions, or /close <Session ID> to close one.")
 		return err
 	}
 
@@ -406,6 +532,105 @@ func (c *Channel) handleAssistant(ctx context.Context, message *message) error {
 		return fmt.Errorf("post Session status: %w", err)
 	}
 	return nil
+}
+
+func (c *Channel) sendSessionList(ctx context.Context) error {
+	records, err := c.sessions.List(ctx)
+	if err != nil {
+		return err
+	}
+	if len(records) == 0 {
+		_, err := c.client.sendMessage(
+			ctx,
+			c.settings.Token,
+			c.settings.ChatID,
+			c.assistantTopicID,
+			"No Sessions.",
+		)
+		return err
+	}
+	if _, err := c.client.sendMessage(
+		ctx,
+		c.settings.Token,
+		c.settings.ChatID,
+		c.assistantTopicID,
+		"Sessions:",
+	); err != nil {
+		return err
+	}
+	for _, record := range records {
+		name := strings.TrimSpace(record.Name)
+		if name == "" {
+			name = "(unnamed)"
+		}
+		text := fmt.Sprintf(
+			"%s\nState: %s\nAgent: %s\nName: %s",
+			record.ID,
+			record.State,
+			record.Agent,
+			name,
+		)
+		if _, err := c.client.sendMessage(
+			ctx,
+			c.settings.Token,
+			c.settings.ChatID,
+			c.assistantTopicID,
+			text,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Channel) closeSession(ctx context.Context, id string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		_, err := c.client.sendMessage(
+			ctx,
+			c.settings.Token,
+			c.settings.ChatID,
+			c.assistantTopicID,
+			"Usage: /close <Session ID>",
+		)
+		return err
+	}
+	record, err := c.sessions.CloseSession(ctx, id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			_, sendErr := c.client.sendMessage(
+				ctx,
+				c.settings.Token,
+				c.settings.ChatID,
+				c.assistantTopicID,
+				"Session not found: "+id,
+			)
+			return sendErr
+		}
+		if errors.Is(err, session.ErrInvalidTransition) {
+			_, sendErr := c.client.sendMessage(
+				ctx,
+				c.settings.Token,
+				c.settings.ChatID,
+				c.assistantTopicID,
+				"Session is already closed: "+id,
+			)
+			return sendErr
+		}
+		return err
+	}
+	name := strings.TrimSpace(record.Name)
+	if name == "" {
+		name = record.ID
+	}
+	_, err = c.client.sendMessage(
+		ctx,
+		c.settings.Token,
+		c.settings.ChatID,
+		c.assistantTopicID,
+		fmt.Sprintf("Session closed: %s (%s).", name, record.ID),
+	)
+	return err
 }
 
 func (c *Channel) sessionSelection(argument string) (string, string, error) {
@@ -497,6 +722,9 @@ func (c *Channel) handlePrompt(ctx context.Context, prompt inboundPrompt) {
 	_, err = c.sessions.Prompt(ctx, record.ID, prompt.text)
 	flushErr := c.waitForDraft(ctx, record.ID)
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return
+		}
 		c.reportPromptError(ctx, record.TopicID, err)
 		return
 	}
@@ -536,12 +764,143 @@ func (c *Channel) Send(ctx context.Context, event channeltypes.Event) error {
 	if record.TopicID == 0 || record.Owner.Channel != "telegram" {
 		return nil
 	}
+	switch permissionEvent := event.AgentEvent.(type) {
+	case agent.PermissionRequested:
+		return c.presentPermission(ctx, record.TopicID, permissionEvent)
+	case agent.PermissionResolved:
+		return c.finishPermission(ctx, permissionEvent)
+	}
 	fragment := renderEvent(event.AgentEvent)
 	if fragment.text == "" {
 		return nil
 	}
 	c.appendDraft(record.ID, record.TopicID, fragment)
 	return nil
+}
+
+func (c *Channel) presentPermission(ctx context.Context, topicID int64, request agent.PermissionRequested) error {
+	buttons := make([]inlineKeyboardButton, 0, len(request.Options))
+	for index, option := range request.Options {
+		callbackData := fmt.Sprintf("%s%s:%d", permissionCallbackPrefix, request.ID, index)
+		if len([]byte(callbackData)) > 64 {
+			return fmt.Errorf("permission callback data is %d bytes, exceeds Telegram's 64-byte limit", len([]byte(callbackData)))
+		}
+		buttons = append(buttons, inlineKeyboardButton{
+			Text:         permissionButtonLabel(option),
+			CallbackData: callbackData,
+		})
+	}
+	if len(buttons) == 0 {
+		return fmt.Errorf("permission request %q offered no response options", request.ID)
+	}
+	rows := make([][]inlineKeyboardButton, 0, len(buttons))
+	for _, button := range buttons {
+		rows = append(rows, []inlineKeyboardButton{button})
+	}
+	sent, err := c.client.sendMessageWithReplyMarkup(
+		ctx,
+		c.settings.Token,
+		c.settings.ChatID,
+		topicID,
+		permissionRequestText(request.Title, request.Kind),
+		&inlineKeyboardMarkup{InlineKeyboard: rows},
+	)
+	if err != nil {
+		return err
+	}
+
+	c.mu.Lock()
+	for id, one := range c.permissions {
+		if !one.completedAt.IsZero() && time.Since(one.completedAt) >= completedPermissionRetention {
+			delete(c.permissions, id)
+		}
+	}
+	c.permissions[request.ID] = &permissionMessage{
+		messageID: sent.MessageID,
+		topicID:   topicID,
+		title:     request.Title,
+		options:   append([]agent.PermissionOption(nil), request.Options...),
+	}
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *Channel) finishPermission(ctx context.Context, result agent.PermissionResolved) error {
+	c.mu.Lock()
+	pending := c.permissions[result.ID]
+	if pending == nil {
+		c.mu.Unlock()
+		return nil
+	}
+	pending.completedAt = time.Now()
+	messageID := pending.messageID
+	title := pending.title
+	options := append([]agent.PermissionOption(nil), pending.options...)
+	c.mu.Unlock()
+
+	outcome := permissionOutcome(result, options)
+	return c.client.editMessageTextWithReplyMarkup(
+		ctx,
+		c.settings.Token,
+		c.settings.ChatID,
+		messageID,
+		permissionRequestText(title, "")+"\nOutcome: "+outcome,
+		&inlineKeyboardMarkup{InlineKeyboard: [][]inlineKeyboardButton{}},
+	)
+}
+
+func permissionRequestText(title, kind string) string {
+	title = strings.TrimSpace(title)
+	if title == "" {
+		title = "Agent action"
+	}
+	text := "Permission requested: " + title
+	if kind != "" {
+		text += "\nKind: " + kind
+	}
+	return text
+}
+
+func permissionButtonLabel(option agent.PermissionOption) string {
+	switch option.Kind {
+	case agent.PermissionAllowOnce:
+		return "Approve"
+	case agent.PermissionAllowAlways:
+		return "Always approve"
+	case agent.PermissionRejectOnce:
+		return "Deny"
+	case agent.PermissionRejectAlways:
+		return "Always deny"
+	default:
+		if name := strings.TrimSpace(option.Name); name != "" {
+			return name
+		}
+		return "Respond"
+	}
+}
+
+func permissionOutcome(result agent.PermissionResolved, options []agent.PermissionOption) string {
+	if result.TimedOut {
+		return "Timed out — denied"
+	}
+	if result.Cancelled {
+		return "Cancelled"
+	}
+	for _, option := range options {
+		if option.ID != result.OptionID {
+			continue
+		}
+		switch option.Kind {
+		case agent.PermissionAllowOnce, agent.PermissionAllowAlways:
+			return "Approved"
+		case agent.PermissionRejectOnce, agent.PermissionRejectAlways:
+			return "Denied"
+		}
+		if name := strings.TrimSpace(option.Name); name != "" {
+			return name
+		}
+	}
+	return "Resolved"
 }
 
 func (c *Channel) beginDraft(sessionID string, topicID int64) {

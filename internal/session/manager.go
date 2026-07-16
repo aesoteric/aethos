@@ -426,7 +426,24 @@ func (m *Manager) ResolvePermission(ctx context.Context, requestID, optionID str
 
 func (m *Manager) permissionHandler(id string) agent.PermissionHandler {
 	return func(permissionCtx context.Context, _ string, request agent.PermissionRequest) (agent.PermissionDecision, error) {
-		return m.permissions.Request(permissionCtx, id, request)
+		result, err := m.permissions.Request(permissionCtx, id, request)
+		if err != nil {
+			return agent.PermissionDecision{}, err
+		}
+		if result.Presented {
+			if sendErr := m.channel.Send(m.ctx, channel.Event{
+				SessionID: id,
+				AgentEvent: agent.PermissionResolved{
+					ID:        result.RequestID,
+					OptionID:  result.Decision.OptionID,
+					TimedOut:  result.TimedOut,
+					Cancelled: result.Decision.Cancelled,
+				},
+			}); sendErr != nil && m.ctx.Err() == nil {
+				m.recordBackgroundError(fmt.Errorf("finish permission request for Session %q: %w", id, sendErr))
+			}
+		}
+		return result.Decision, nil
 	}
 }
 

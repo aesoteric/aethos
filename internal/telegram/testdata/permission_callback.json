@@ -1,0 +1,35 @@
+{
+  "ok": true,
+  "result": [
+    {
+      "update_id": 21,
+      "callback_query": {
+        "id": "approve-1",
+        "from": {"id": 123456789, "first_name": "Alice"},
+        "message": {
+          "message_id": {{MESSAGE_ID}},
+          "message_thread_id": 303,
+          "is_topic_message": true,
+          "chat": {"id": -1001234567890, "type": "supergroup", "is_forum": true},
+          "text": "Permission requested: Update config.toml"
+        },
+        "data": "{{CALLBACK_DATA}}"
+      }
+    },
+    {
+      "update_id": 22,
+      "callback_query": {
+        "id": "approve-2",
+        "from": {"id": 123456789, "first_name": "Alice"},
+        "message": {
+          "message_id": {{MESSAGE_ID}},
+          "message_thread_id": 303,
+          "is_topic_message": true,
+          "chat": {"id": -1001234567890, "type": "supergroup", "is_forum": true},
+          "text": "Permission requested: Update config.toml"
+        },
+        "data": "{{CALLBACK_DATA}}"
+      }
+    }
+  ]
+}

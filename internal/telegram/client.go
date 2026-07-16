@@ -45,8 +45,25 @@ type message struct {
 }
 
 type update struct {
-	UpdateID int64    `json:"update_id"`
-	Message  *message `json:"message"`
+	UpdateID      int64          `json:"update_id"`
+	Message       *message       `json:"message"`
+	CallbackQuery *callbackQuery `json:"callback_query"`
+}
+
+type callbackQuery struct {
+	ID      string   `json:"id"`
+	From    *user    `json:"from"`
+	Message *message `json:"message"`
+	Data    string   `json:"data"`
+}
+
+type inlineKeyboardMarkup struct {
+	InlineKeyboard [][]inlineKeyboardButton `json:"inline_keyboard"`
+}
+
+type inlineKeyboardButton struct {
+	Text         string `json:"text"`
+	CallbackData string `json:"callback_data"`
 }
 
 type forumTopic struct {
@@ -95,7 +112,7 @@ func (c *Client) getUpdates(ctx context.Context, token string, offset int64, tim
 		Offset         int64    `json:"offset,omitempty"`
 		Timeout        int      `json:"timeout"`
 		AllowedUpdates []string `json:"allowed_updates"`
-	}{Offset: offset, Timeout: seconds, AllowedUpdates: []string{"message"}}, &result)
+	}{Offset: offset, Timeout: seconds, AllowedUpdates: []string{"message", "callback_query"}}, &result)
 	return result, err
 }
 
@@ -126,23 +143,59 @@ func (c *Client) deleteForumTopic(ctx context.Context, token string, chatID, top
 }
 
 func (c *Client) sendMessage(ctx context.Context, token string, chatID, topicID int64, text string) (message, error) {
+	return c.sendMessageWithReplyMarkup(ctx, token, chatID, topicID, text, nil)
+}
+
+func (c *Client) sendMessageWithReplyMarkup(
+	ctx context.Context,
+	token string,
+	chatID, topicID int64,
+	text string,
+	replyMarkup *inlineKeyboardMarkup,
+) (message, error) {
 	var result message
 	err := c.call(ctx, token, "sendMessage", struct {
-		ChatID              int64  `json:"chat_id"`
-		MessageThreadID     int64  `json:"message_thread_id,omitempty"`
-		Text                string `json:"text"`
-		DisableNotification bool   `json:"disable_notification,omitempty"`
-	}{ChatID: chatID, MessageThreadID: topicID, Text: text, DisableNotification: true}, &result)
+		ChatID              int64                 `json:"chat_id"`
+		MessageThreadID     int64                 `json:"message_thread_id,omitempty"`
+		Text                string                `json:"text"`
+		DisableNotification bool                  `json:"disable_notification,omitempty"`
+		ReplyMarkup         *inlineKeyboardMarkup `json:"reply_markup,omitempty"`
+	}{
+		ChatID:              chatID,
+		MessageThreadID:     topicID,
+		Text:                text,
+		DisableNotification: true,
+		ReplyMarkup:         replyMarkup,
+	}, &result)
 	return result, err
 }
 
 func (c *Client) editMessageText(ctx context.Context, token string, chatID, messageID int64, text string) error {
+	return c.editMessageTextWithReplyMarkup(ctx, token, chatID, messageID, text, nil)
+}
+
+func (c *Client) editMessageTextWithReplyMarkup(
+	ctx context.Context,
+	token string,
+	chatID, messageID int64,
+	text string,
+	replyMarkup *inlineKeyboardMarkup,
+) error {
 	var result any
 	return c.call(ctx, token, "editMessageText", struct {
-		ChatID    int64  `json:"chat_id"`
-		MessageID int64  `json:"message_id"`
-		Text      string `json:"text"`
-	}{ChatID: chatID, MessageID: messageID, Text: text}, &result)
+		ChatID      int64                 `json:"chat_id"`
+		MessageID   int64                 `json:"message_id"`
+		Text        string                `json:"text"`
+		ReplyMarkup *inlineKeyboardMarkup `json:"reply_markup,omitempty"`
+	}{ChatID: chatID, MessageID: messageID, Text: text, ReplyMarkup: replyMarkup}, &result)
+}
+
+func (c *Client) answerCallbackQuery(ctx context.Context, token, callbackQueryID, text string) error {
+	var result bool
+	return c.call(ctx, token, "answerCallbackQuery", struct {
+		CallbackQueryID string `json:"callback_query_id"`
+		Text            string `json:"text,omitempty"`
+	}{CallbackQueryID: callbackQueryID, Text: text}, &result)
 }
 
 func (c *Client) call(ctx context.Context, token, method string, parameters, result any) error {

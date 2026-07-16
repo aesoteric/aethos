@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -287,6 +288,340 @@ func TestTelegramChannelFindsAssistantAndResumesDormantSessionAfterRestart(t *te
 	}
 }
 
+func TestTelegramPermissionButtonsRouteFixtureCallbacksAndRemoveKeyboard(t *testing.T) {
+	api := newTelegramFixtureAPI(t, readUpdateFixture(t, "permission_prompt.json"))
+	database := filepath.Join(t.TempDir(), "aethos.db")
+	bridge, err := telegram.Open(
+		t.Context(),
+		database,
+		telegram.NewClient(api.server.URL, api.server.Client()),
+		slog.New(slog.DiscardHandler),
+		telegram.Settings{
+			Token:          "test-token",
+			ChatID:         -1001234567890,
+			AllowedUserIDs: []int64{123456789},
+			DefaultAgent:   "agent",
+			Workspace:      "/workspace",
+		},
+		telegram.WithWriteInterval(time.Millisecond),
+		telegram.WithPollTimeout(time.Second),
+	)
+	if err != nil {
+		t.Fatalf("open Telegram Channel: %v", err)
+	}
+	t.Cleanup(func() { _ = bridge.Close() })
+
+	script := agent.Script{Turns: []agent.Turn{{
+		WantPrompt: "update the config",
+		Permissions: []agent.ScriptedPermission{{
+			Request: agent.PermissionRequest{
+				ToolCallID: "call-1",
+				Title:      "Update config.toml",
+				Kind:       "edit",
+				Options: []agent.PermissionOption{
+					{ID: "allow-once", Name: "Allow once", Kind: agent.PermissionAllowOnce},
+					{ID: "reject-once", Name: "Reject once", Kind: agent.PermissionRejectOnce},
+				},
+			},
+			WantOptionID: "allow-once",
+		}},
+		Events: []agent.Event{agent.Message{Text: "config updated"}},
+		Stop:   agent.StopEndTurn,
+	}}}
+	manager, err := session.Open(t.Context(), database, scriptedConnector(&script), bridge)
+	if err != nil {
+		t.Fatalf("open Session manager: %v", err)
+	}
+	t.Cleanup(func() { _ = manager.Close() })
+	_, err = manager.Create(t.Context(), session.Create{
+		Agent:     "agent",
+		Workspace: "/workspace",
+		Owner:     session.Owner{Channel: "telegram", ID: "123456789"},
+		TopicID:   303,
+	})
+	if err != nil {
+		t.Fatalf("create Session: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- bridge.Run(ctx, manager) }()
+
+	var permissionMessageID int64
+	var approveData string
+	waitFor(t, func() bool {
+		permissionMessageID, approveData = api.permissionButton(303, "Update config.toml", "Approve")
+		return permissionMessageID != 0 && approveData != ""
+	})
+	if _, denyData := api.permissionButton(303, "Update config.toml", "Deny"); denyData == "" {
+		t.Fatal("permission request did not include a Deny button")
+	}
+	if len([]byte(approveData)) > 64 {
+		t.Fatalf("Approve callback data is %d bytes, want at most 64", len([]byte(approveData)))
+	}
+
+	callbackFixture := string(readUpdateFixture(t, "permission_callback.json"))
+	callbackFixture = strings.ReplaceAll(callbackFixture, "{{MESSAGE_ID}}", strconv.FormatInt(permissionMessageID, 10))
+	callbackFixture = strings.ReplaceAll(callbackFixture, "{{CALLBACK_DATA}}", approveData)
+	api.addFixture([]byte(callbackFixture))
+
+	waitFor(t, func() bool {
+		return api.hasCall("editMessageText", func(body map[string]any) bool {
+			markup, _ := body["reply_markup"].(map[string]any)
+			keyboard, _ := markup["inline_keyboard"].([]any)
+			text, _ := body["text"].(string)
+			return body["message_id"] == float64(permissionMessageID) &&
+				strings.Contains(text, "Approved") && len(keyboard) == 0
+		}) && api.count("answerCallbackQuery") == 2 && api.hasVisibleMessage(303, "config updated")
+	})
+	for _, callbackID := range []string{"approve-1", "approve-2"} {
+		if !api.hasCall("answerCallbackQuery", func(body map[string]any) bool {
+			return body["callback_query_id"] == callbackID
+		}) {
+			t.Errorf("callback %q was not acknowledged", callbackID)
+		}
+	}
+
+	cancel()
+	if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("run Telegram Channel: %v", err)
+	}
+}
+
+func TestTelegramPermissionTimeoutRemovesButtonsAndShowsOutcome(t *testing.T) {
+	api := newTelegramFixtureAPI(t, readUpdateFixture(t, "permission_prompt.json"))
+	database := filepath.Join(t.TempDir(), "aethos.db")
+	bridge, err := telegram.Open(
+		t.Context(),
+		database,
+		telegram.NewClient(api.server.URL, api.server.Client()),
+		slog.New(slog.DiscardHandler),
+		telegram.Settings{
+			Token:          "test-token",
+			ChatID:         -1001234567890,
+			AllowedUserIDs: []int64{123456789},
+			DefaultAgent:   "agent",
+			Workspace:      "/workspace",
+		},
+		telegram.WithWriteInterval(time.Millisecond),
+		telegram.WithPollTimeout(time.Second),
+	)
+	if err != nil {
+		t.Fatalf("open Telegram Channel: %v", err)
+	}
+	t.Cleanup(func() { _ = bridge.Close() })
+
+	script := agent.Script{Turns: []agent.Turn{{
+		WantPrompt: "update the config",
+		Permissions: []agent.ScriptedPermission{{
+			Request: agent.PermissionRequest{
+				ToolCallID: "call-1",
+				Title:      "Update config.toml",
+				Kind:       "edit",
+				Options: []agent.PermissionOption{
+					{ID: "allow-once", Name: "Allow once", Kind: agent.PermissionAllowOnce},
+					{ID: "reject-once", Name: "Reject once", Kind: agent.PermissionRejectOnce},
+				},
+			},
+			WantOptionID: "reject-once",
+		}},
+		Events: []agent.Event{agent.Message{Text: "continued after denial"}},
+		Stop:   agent.StopEndTurn,
+	}}}
+	manager, err := session.Open(
+		t.Context(),
+		database,
+		scriptedConnector(&script),
+		bridge,
+		session.WithPermissionTimeout(25*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatalf("open Session manager: %v", err)
+	}
+	t.Cleanup(func() { _ = manager.Close() })
+	_, err = manager.Create(t.Context(), session.Create{
+		Agent:     "agent",
+		Workspace: "/workspace",
+		Owner:     session.Owner{Channel: "telegram", ID: "123456789"},
+		TopicID:   303,
+	})
+	if err != nil {
+		t.Fatalf("create Session: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- bridge.Run(ctx, manager) }()
+
+	waitFor(t, func() bool {
+		return api.hasCall("editMessageText", func(body map[string]any) bool {
+			markup, _ := body["reply_markup"].(map[string]any)
+			keyboard, _ := markup["inline_keyboard"].([]any)
+			text, _ := body["text"].(string)
+			return strings.Contains(text, "Timed out") && len(keyboard) == 0
+		}) && api.hasVisibleMessage(303, "continued after denial")
+	})
+	if api.count("answerCallbackQuery") != 0 {
+		t.Errorf("timeout answered %d callback queries, want none", api.count("answerCallbackQuery"))
+	}
+
+	cancel()
+	if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("run Telegram Channel: %v", err)
+	}
+}
+
+func TestTelegramCancelCommandStopsInflightPrompt(t *testing.T) {
+	api := newTelegramFixtureAPI(t, readUpdateFixture(t, "cancel_prompt.json"))
+	database := filepath.Join(t.TempDir(), "aethos.db")
+	bridge, err := telegram.Open(
+		t.Context(),
+		database,
+		telegram.NewClient(api.server.URL, api.server.Client()),
+		slog.New(slog.DiscardHandler),
+		telegram.Settings{
+			Token:          "test-token",
+			ChatID:         -1001234567890,
+			AllowedUserIDs: []int64{123456789},
+			DefaultAgent:   "agent",
+			Workspace:      "/workspace",
+		},
+		telegram.WithWriteInterval(time.Millisecond),
+		telegram.WithPollTimeout(time.Second),
+	)
+	if err != nil {
+		t.Fatalf("open Telegram Channel: %v", err)
+	}
+	t.Cleanup(func() { _ = bridge.Close() })
+
+	started := make(chan struct{}, 1)
+	neverContinue := make(chan struct{})
+	script := agent.Script{Turns: []agent.Turn{{
+		WantPrompt: "keep working",
+		Started:    started,
+		Continue:   neverContinue,
+		Stop:       agent.StopEndTurn,
+	}}}
+	manager, err := session.Open(t.Context(), database, scriptedConnector(&script), bridge)
+	if err != nil {
+		t.Fatalf("open Session manager: %v", err)
+	}
+	t.Cleanup(func() { _ = manager.Close() })
+	record, err := manager.Create(t.Context(), session.Create{
+		Agent:     "agent",
+		Workspace: "/workspace",
+		Owner:     session.Owner{Channel: "telegram", ID: "123456789"},
+		TopicID:   303,
+	})
+	if err != nil {
+		t.Fatalf("create Session: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- bridge.Run(ctx, manager) }()
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Prompt did not start")
+	}
+	api.addFixture(readUpdateFixture(t, "cancel_command.json"))
+
+	waitFor(t, func() bool { return api.hasVisibleMessage(303, "Prompt cancelled.") })
+	if api.hasVisibleMessage(303, "Prompt failed") {
+		t.Error("cancelled Prompt was also reported as failed")
+	}
+	got, err := manager.Get(t.Context(), record.ID)
+	if err != nil {
+		t.Fatalf("get Session after cancel: %v", err)
+	}
+	if got.State != session.Live {
+		t.Errorf("Session state after cancel = %q, want %q", got.State, session.Live)
+	}
+
+	cancel()
+	if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("run Telegram Channel: %v", err)
+	}
+}
+
+func TestTelegramAssistantListsAndClosesSessions(t *testing.T) {
+	api := newTelegramFixtureAPI(t, []byte(`{"ok":true,"result":[]}`))
+	database := filepath.Join(t.TempDir(), "aethos.db")
+	bridge, err := telegram.Open(
+		t.Context(),
+		database,
+		telegram.NewClient(api.server.URL, api.server.Client()),
+		slog.New(slog.DiscardHandler),
+		telegram.Settings{
+			Token:          "test-token",
+			ChatID:         -1001234567890,
+			AllowedUserIDs: []int64{123456789},
+			DefaultAgent:   "agent",
+			Workspace:      "/workspace",
+		},
+		telegram.WithWriteInterval(time.Millisecond),
+		telegram.WithPollTimeout(time.Second),
+	)
+	if err != nil {
+		t.Fatalf("open Telegram Channel: %v", err)
+	}
+	t.Cleanup(func() { _ = bridge.Close() })
+	manager, err := session.Open(t.Context(), database, scriptedConnector(&agent.Script{}), bridge)
+	if err != nil {
+		t.Fatalf("open Session manager: %v", err)
+	}
+	t.Cleanup(func() { _ = manager.Close() })
+	record, err := manager.Create(t.Context(), session.Create{
+		Agent:     "codex-acp",
+		Workspace: "/workspace",
+		Owner:     session.Owner{Channel: "telegram", ID: "123456789"},
+		TopicID:   303,
+	})
+	if err != nil {
+		t.Fatalf("create Session: %v", err)
+	}
+	record, err = manager.Rename(t.Context(), record.ID, "Fix flaky tests")
+	if err != nil {
+		t.Fatalf("rename Session: %v", err)
+	}
+	controls := strings.ReplaceAll(string(readUpdateFixture(t, "session_controls.json")), "{{SESSION_ID}}", record.ID)
+	api.addFixture([]byte(controls))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- bridge.Run(ctx, manager) }()
+
+	waitFor(t, func() bool {
+		return api.hasCall("sendMessage", func(body map[string]any) bool {
+			text, _ := body["text"].(string)
+			return body["message_thread_id"] == float64(101) && strings.Contains(text, record.ID) &&
+				strings.Contains(text, "Fix flaky tests") && strings.Contains(text, "codex-acp") &&
+				strings.Contains(text, "live")
+		}) && api.hasCall("sendMessage", func(body map[string]any) bool {
+			text, _ := body["text"].(string)
+			return body["message_thread_id"] == float64(101) &&
+				strings.Contains(text, "Session closed") && strings.Contains(text, "Fix flaky tests")
+		}) && api.hasCall("sendMessage", func(body map[string]any) bool {
+			text, _ := body["text"].(string)
+			return body["message_thread_id"] == float64(101) && strings.Contains(text, record.ID) &&
+				strings.Contains(text, "closed")
+		})
+	})
+	closed, err := manager.Get(t.Context(), record.ID)
+	if err != nil {
+		t.Fatalf("get closed Session: %v", err)
+	}
+	if closed.State != session.Closed {
+		t.Errorf("Session state = %q, want %q", closed.State, session.Closed)
+	}
+
+	cancel()
+	if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("run Telegram Channel: %v", err)
+	}
+}
+
 func readUpdateFixture(t *testing.T, name string) []byte {
 	t.Helper()
 	fixture, err := os.ReadFile(filepath.Join("testdata", name))
@@ -329,6 +664,7 @@ type telegramFixtureAPI struct {
 	mu             sync.Mutex
 	calls          []telegramCall
 	fixtures       [][]byte
+	fixtureAdded   chan struct{}
 	nextMessageID  int64
 	nextSessionTop int64
 	messages       map[int64]telegramMessage
@@ -338,6 +674,7 @@ func newTelegramFixtureAPI(t *testing.T, fixture []byte) *telegramFixtureAPI {
 	t.Helper()
 	api := &telegramFixtureAPI{
 		fixtures:       [][]byte{fixture},
+		fixtureAdded:   make(chan struct{}, 1),
 		nextMessageID:  400,
 		nextSessionTop: 202,
 		messages:       make(map[int64]telegramMessage),
@@ -392,18 +729,25 @@ func (a *telegramFixtureAPI) handle(w http.ResponseWriter, r *http.Request) {
 	case "editForumTopic", "deleteForumTopic":
 		fmt.Fprint(w, `{"ok":true,"result":true}`)
 	case "getUpdates":
-		a.mu.Lock()
-		var fixture []byte
-		if len(a.fixtures) > 0 {
-			fixture = a.fixtures[0]
-			a.fixtures = a.fixtures[1:]
+		for {
+			a.mu.Lock()
+			var fixture []byte
+			if len(a.fixtures) > 0 {
+				fixture = a.fixtures[0]
+				a.fixtures = a.fixtures[1:]
+			}
+			a.mu.Unlock()
+			if fixture != nil {
+				_, _ = w.Write(fixture)
+				return
+			}
+			select {
+			case <-a.fixtureAdded:
+				continue
+			case <-r.Context().Done():
+				return
+			}
 		}
-		a.mu.Unlock()
-		if fixture != nil {
-			_, _ = w.Write(fixture)
-			return
-		}
-		<-r.Context().Done()
 	default:
 		http.NotFound(w, r)
 	}
@@ -411,8 +755,43 @@ func (a *telegramFixtureAPI) handle(w http.ResponseWriter, r *http.Request) {
 
 func (a *telegramFixtureAPI) addFixture(fixture []byte) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	a.fixtures = append(a.fixtures, fixture)
+	a.mu.Unlock()
+	select {
+	case a.fixtureAdded <- struct{}{}:
+	default:
+	}
+}
+
+func (a *telegramFixtureAPI) permissionButton(topicID int64, text, label string) (int64, string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, call := range a.calls {
+		if call.method != "sendMessage" || call.body["message_thread_id"] != float64(topicID) {
+			continue
+		}
+		messageText, _ := call.body["text"].(string)
+		if !strings.Contains(messageText, text) {
+			continue
+		}
+		markup, _ := call.body["reply_markup"].(map[string]any)
+		rows, _ := markup["inline_keyboard"].([]any)
+		for _, rawRow := range rows {
+			row, _ := rawRow.([]any)
+			for _, rawButton := range row {
+				button, _ := rawButton.(map[string]any)
+				if button["text"] == label {
+					for messageID, message := range a.messages {
+						if message.topicID == topicID && message.text == messageText {
+							callbackData, _ := button["callback_data"].(string)
+							return messageID, callbackData
+						}
+					}
+				}
+			}
+		}
+	}
+	return 0, ""
 }
 
 func (a *telegramFixtureAPI) count(method string) int {

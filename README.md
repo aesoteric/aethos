@@ -45,6 +45,11 @@ Send `/new` there to use the configured defaults, or
 its own Topic; its first Prompt becomes the Session and Topic name. Plain
 messages sent to General are redirected to Assistant.
 
+Send `/sessions` in Assistant to list every Session with its lifecycle state,
+Agent, name, and ID. Archive one deliberately with `/close <Session ID>`; closed
+Sessions remain listed and cannot be resumed by a plain Prompt. Send `/cancel`
+inside a Session Topic to stop its current Prompt without closing the Session.
+
 The data directory defaults to `~/.aethos/`. Override it with
 `aethos -data-dir /path/to/data` or `AETHOS_DATA_DIR`; configuration, database,
 and log paths are all rooted there. Environment values override the file:
@@ -69,7 +74,8 @@ auto_approve = ["read", "search"]
 
 Auto-approved requests select a one-time allow option when the Agent offers one.
 File edits, shell commands, and any tool kind not listed still pause the Prompt
-for a Channel response.
+for Approve/Deny buttons in the Session Topic. Answered and timed-out requests
+replace those buttons with their outcome; unanswered requests deny fail-safe.
 
 Invalid TOML, unknown fields, and missing required values stop startup with an
 actionable error.

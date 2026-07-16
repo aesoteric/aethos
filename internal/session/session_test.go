@@ -235,8 +235,12 @@ func TestPermissionRequestPausesPromptAndDoubleResolveIsIdempotent(t *testing.T)
 		t.Errorf("stop reason = %q, want %q", result.stop, agent.StopEndTurn)
 	}
 
-	waitFor(t, func() bool { return len(memory.Snapshot()) == 2 })
-	got := memory.Snapshot()[1]
+	waitFor(t, func() bool { return len(memory.Snapshot()) == 3 })
+	resolution, ok := memory.Snapshot()[1].AgentEvent.(agent.PermissionResolved)
+	if !ok || resolution.ID != request.ID || resolution.OptionID != "allow-once" || resolution.TimedOut || resolution.Cancelled {
+		t.Errorf("permission resolution = %#v, want approved request %q", resolution, request.ID)
+	}
+	got := memory.Snapshot()[2]
 	want := channel.Event{SessionID: record.ID, AgentEvent: agent.Message{Text: "config updated"}}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("event after approval = %#v, want %#v", got, want)
@@ -291,7 +295,11 @@ func TestChannelDenialReturnsToAgentAndPromptContinues(t *testing.T) {
 	}
 
 	want := channel.Event{SessionID: record.ID, AgentEvent: agent.Message{Text: "I skipped deployment and continued."}}
-	if got := memory.Snapshot()[1]; !reflect.DeepEqual(got, want) {
+	resolution, ok := memory.Snapshot()[1].AgentEvent.(agent.PermissionResolved)
+	if !ok || resolution.ID != request.ID || resolution.OptionID != "reject-once" || resolution.TimedOut || resolution.Cancelled {
+		t.Errorf("permission resolution = %#v, want denied request %q", resolution, request.ID)
+	}
+	if got := memory.Snapshot()[2]; !reflect.DeepEqual(got, want) {
 		t.Errorf("event after denial = %#v, want %#v", got, want)
 	}
 }
@@ -340,15 +348,20 @@ func TestUnansweredPermissionTimesOutAsDenialAndAgentContinues(t *testing.T) {
 		t.Errorf("stop reason = %q, want %q", stop, agent.StopEndTurn)
 	}
 	events := memory.Snapshot()
-	if len(events) != 2 {
-		t.Fatalf("events = %#v, want permission request followed by Agent response", events)
+	if len(events) != 3 {
+		t.Fatalf("events = %#v, want permission request, timeout, then Agent response", events)
 	}
 	if _, ok := events[0].AgentEvent.(agent.PermissionRequested); !ok {
 		t.Errorf("first event = %T, want agent.PermissionRequested", events[0].AgentEvent)
 	}
+	request := events[0].AgentEvent.(agent.PermissionRequested)
+	resolution, ok := events[1].AgentEvent.(agent.PermissionResolved)
+	if !ok || resolution.ID != request.ID || resolution.OptionID != "reject-once" || !resolution.TimedOut || resolution.Cancelled {
+		t.Errorf("permission resolution = %#v, want timed-out denial for %q", resolution, request.ID)
+	}
 	want := channel.Event{SessionID: record.ID, AgentEvent: agent.Message{Text: "I left the files in place."}}
-	if !reflect.DeepEqual(events[1], want) {
-		t.Errorf("event after denial = %#v, want %#v", events[1], want)
+	if !reflect.DeepEqual(events[2], want) {
+		t.Errorf("event after denial = %#v, want %#v", events[2], want)
 	}
 }
 
