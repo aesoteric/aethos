@@ -22,6 +22,38 @@ type Channel interface {
 	Send(context.Context, Event) error
 }
 
+// SessionEvent is one Session-owned occurrence that a Channel may surface in
+// addition to events translated from the Agent protocol.
+type SessionEvent interface{ isSessionEvent() }
+
+// PromptStarted reports that a queued Prompt has begun processing.
+type PromptStarted struct{ Prompt string }
+
+// PromptFinished reports the terminal result of a Prompt.
+type PromptFinished struct {
+	StopReason agent.StopReason
+	Error      string
+}
+
+// SessionStateChanged reports a durable Session lifecycle transition.
+type SessionStateChanged struct{ State string }
+
+func (PromptStarted) isSessionEvent()       {}
+func (PromptFinished) isSessionEvent()      {}
+func (SessionStateChanged) isSessionEvent() {}
+
+// LifecycleEvent addresses a Session-owned event to its owning Channel.
+type LifecycleEvent struct {
+	SessionID    string
+	SessionEvent SessionEvent
+}
+
+// LifecycleChannel is implemented by Channels that surface Prompt and Session
+// lifecycle events. Channels that only render Agent output may omit it.
+type LifecycleChannel interface {
+	SendLifecycle(context.Context, LifecycleEvent) error
+}
+
 // OwnerLookup returns the owning Channel name for a Session.
 type OwnerLookup func(context.Context, string) (string, error)
 
@@ -60,6 +92,24 @@ func (r *Router) Send(ctx context.Context, event Event) error {
 		return fmt.Errorf("no Channel registered for Session owner %q", owner)
 	}
 	return target.Send(ctx, event)
+}
+
+// SendLifecycle routes a Session-owned event when its Channel supports
+// lifecycle observation.
+func (r *Router) SendLifecycle(ctx context.Context, event LifecycleEvent) error {
+	owner, err := r.owner(ctx, event.SessionID)
+	if err != nil {
+		return err
+	}
+	target := r.routes[owner]
+	if target == nil {
+		return fmt.Errorf("no Channel registered for Session owner %q", owner)
+	}
+	lifecycle, ok := target.(LifecycleChannel)
+	if !ok {
+		return nil
+	}
+	return lifecycle.SendLifecycle(ctx, event)
 }
 
 // Prompt is inbound text addressed to an existing Session.

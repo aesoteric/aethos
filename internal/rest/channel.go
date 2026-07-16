@@ -15,10 +15,12 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aesoteric/aethos/internal/agent"
 	"github.com/aesoteric/aethos/internal/channel"
+	"github.com/aesoteric/aethos/internal/permission"
 	"github.com/aesoteric/aethos/internal/session"
 )
 
@@ -38,12 +40,34 @@ type sessionTarget interface {
 	Get(context.Context, string) (session.Record, error)
 	List(context.Context) ([]session.Record, error)
 	Prompt(context.Context, string, string) (agent.StopReason, error)
+	ResolvePermission(context.Context, string, string) error
 }
 
 // Channel translates authenticated HTTP requests into Session operations.
 type Channel struct {
 	settings Settings
 	logger   *slog.Logger
+
+	streamMu       sync.Mutex
+	streams        map[string]map[uint64]*eventSubscriber
+	nextSubscriber uint64
+}
+
+type eventSubscriber struct {
+	events chan serverEvent
+	done   <-chan struct{}
+}
+
+type serverEvent struct {
+	name     string
+	data     []byte
+	terminal bool
+}
+
+type permissionOptionEvent struct {
+	ID   string                     `json:"id"`
+	Name string                     `json:"name"`
+	Kind agent.PermissionOptionKind `json:"kind"`
 }
 
 // New validates settings and prepares a REST Channel.
@@ -60,7 +84,11 @@ func New(settings Settings, logger *slog.Logger) (*Channel, error) {
 	if logger == nil {
 		return nil, fmt.Errorf("logger is required")
 	}
-	return &Channel{settings: settings, logger: logger}, nil
+	return &Channel{
+		settings: settings,
+		logger:   logger,
+		streams:  make(map[string]map[uint64]*eventSubscriber),
+	}, nil
 }
 
 // Run listens for automation requests until ctx is cancelled.
@@ -117,6 +145,10 @@ func (c *Channel) Handler(sessions sessionTarget) http.Handler {
 			c.createSession(w, r, sessions)
 		case r.Method == http.MethodGet && r.URL.Path == "/sessions":
 			c.listSessions(w, r, sessions)
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/events"):
+			c.streamSession(w, r, sessions)
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/permissions/"):
+			c.answerPermission(w, r, sessions)
 		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/sessions/"):
 			c.promptSession(w, r, sessions)
 		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/sessions/"):
@@ -125,6 +157,136 @@ func (c *Channel) Handler(sessions sessionTarget) http.Handler {
 			writeError(w, http.StatusNotFound, "endpoint not found")
 		}
 	})
+}
+
+func (c *Channel) answerPermission(w http.ResponseWriter, r *http.Request, sessions sessionTarget) {
+	requestID := strings.TrimPrefix(r.URL.Path, "/permissions/")
+	if requestID == "" || strings.Contains(requestID, "/") {
+		writeError(w, http.StatusNotFound, "endpoint not found")
+		return
+	}
+	var input struct {
+		OptionID string `json:"option_id"`
+	}
+	if err := decodeJSON(w, r, &input); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if strings.TrimSpace(input.OptionID) == "" {
+		writeError(w, http.StatusBadRequest, "option_id is required")
+		return
+	}
+	if err := sessions.ResolvePermission(r.Context(), requestID, input.OptionID); err != nil {
+		switch {
+		case errors.Is(err, permission.ErrUnknownRequest):
+			writeError(w, http.StatusNotFound, "permission request not found")
+		case errors.Is(err, permission.ErrUnknownOption):
+			writeError(w, http.StatusBadRequest, "permission option was not offered")
+		default:
+			writeSessionError(w, err)
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Message string `json:"message"`
+	}{Message: "Permission response recorded"})
+}
+
+func (c *Channel) streamSession(w http.ResponseWriter, r *http.Request, sessions sessionTarget) {
+	id, action, ok := sessionAction(r.URL.Path)
+	if !ok || action != "events" {
+		writeError(w, http.StatusNotFound, "endpoint not found")
+		return
+	}
+	record, err := sessions.Get(r.Context(), id)
+	if err != nil {
+		writeSessionError(w, err)
+		return
+	}
+	if record.State == session.Closed {
+		writeError(w, http.StatusConflict, "Session is closed")
+		return
+	}
+
+	subscriberID, subscriber := c.subscribe(id, r.Context().Done())
+	defer c.unsubscribe(id, subscriberID)
+	record, err = sessions.Get(r.Context(), id)
+	if err != nil {
+		writeSessionError(w, err)
+		return
+	}
+	if record.State == session.Closed {
+		writeError(w, http.StatusConflict, "Session is closed")
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "event streaming is unavailable")
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	_, _ = io.WriteString(w, ": connected; events are live-only and are not replayed\n\n")
+	flusher.Flush()
+
+	for {
+		select {
+		case event := <-subscriber.events:
+			if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event.name, event.data); err != nil {
+				return
+			}
+			flusher.Flush()
+			if event.terminal {
+				return
+			}
+		case <-r.Context().Done():
+			return
+		}
+	}
+}
+
+func (c *Channel) subscribe(sessionID string, done <-chan struct{}) (uint64, *eventSubscriber) {
+	c.streamMu.Lock()
+	defer c.streamMu.Unlock()
+	c.nextSubscriber++
+	id := c.nextSubscriber
+	subscriber := &eventSubscriber{events: make(chan serverEvent, 32), done: done}
+	if c.streams[sessionID] == nil {
+		c.streams[sessionID] = make(map[uint64]*eventSubscriber)
+	}
+	c.streams[sessionID][id] = subscriber
+	return id, subscriber
+}
+
+func (c *Channel) unsubscribe(sessionID string, subscriberID uint64) {
+	c.streamMu.Lock()
+	defer c.streamMu.Unlock()
+	subscribers := c.streams[sessionID]
+	delete(subscribers, subscriberID)
+	if len(subscribers) == 0 {
+		delete(c.streams, sessionID)
+	}
+}
+
+func (c *Channel) publish(ctx context.Context, sessionID string, event serverEvent) error {
+	c.streamMu.Lock()
+	defer c.streamMu.Unlock()
+	for id, subscriber := range c.streams[sessionID] {
+		select {
+		case subscriber.events <- event:
+		case <-subscriber.done:
+			delete(c.streams[sessionID], id)
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	if len(c.streams[sessionID]) == 0 {
+		delete(c.streams, sessionID)
+	}
+	return nil
 }
 
 func (c *Channel) health(w http.ResponseWriter, r *http.Request, sessions sessionTarget) {
@@ -328,8 +490,124 @@ func writeSessionError(w http.ResponseWriter, err error) {
 	}
 }
 
-// Send implements channel.Channel. Event streaming is added by the SSE
-// Channel work; core REST control does not block Agent delivery.
-func (c *Channel) Send(context.Context, channel.Event) error {
-	return nil
+// Send implements channel.Channel by publishing Agent events to clients that
+// are currently observing the event's Session.
+func (c *Channel) Send(ctx context.Context, event channel.Event) error {
+	outbound, ok, err := agentServerEvent(event.AgentEvent)
+	if err != nil {
+		return fmt.Errorf("encode REST event for Session %q: %w", event.SessionID, err)
+	}
+	if !ok {
+		return nil
+	}
+	return c.publish(ctx, event.SessionID, outbound)
+}
+
+// SendLifecycle implements channel.LifecycleChannel for the machine head.
+func (c *Channel) SendLifecycle(ctx context.Context, event channel.LifecycleEvent) error {
+	outbound, err := lifecycleServerEvent(event.SessionEvent)
+	if err != nil {
+		return fmt.Errorf("encode REST lifecycle event for Session %q: %w", event.SessionID, err)
+	}
+	return c.publish(ctx, event.SessionID, outbound)
+}
+
+func lifecycleServerEvent(event channel.SessionEvent) (serverEvent, error) {
+	var name string
+	var payload any
+	terminal := false
+	switch one := event.(type) {
+	case channel.PromptStarted:
+		name = "prompt_started"
+		payload = struct {
+			Prompt string `json:"prompt"`
+		}{Prompt: one.Prompt}
+	case channel.PromptFinished:
+		name = "prompt_finished"
+		payload = struct {
+			StopReason agent.StopReason `json:"stop_reason,omitempty"`
+			Error      string           `json:"error,omitempty"`
+		}{StopReason: one.StopReason, Error: one.Error}
+	case channel.SessionStateChanged:
+		name = "session_state_changed"
+		terminal = one.State == string(session.Closed)
+		payload = struct {
+			State string `json:"state"`
+		}{State: one.State}
+	default:
+		return serverEvent{}, fmt.Errorf("unsupported lifecycle event %T", event)
+	}
+	data, err := json.Marshal(payload)
+	return serverEvent{name: name, data: data, terminal: terminal}, err
+}
+
+func agentServerEvent(event agent.Event) (serverEvent, bool, error) {
+	var name string
+	var payload any
+	switch one := event.(type) {
+	case agent.Thought:
+		name = "thought"
+		payload = struct {
+			Text string `json:"text"`
+		}{Text: one.Text}
+	case agent.Message:
+		name = "message"
+		payload = struct {
+			Text string `json:"text"`
+		}{Text: one.Text}
+	case agent.ToolCallBegan:
+		name = "tool_call_began"
+		payload = struct {
+			ID     string `json:"id"`
+			Title  string `json:"title"`
+			Kind   string `json:"kind,omitempty"`
+			Status string `json:"status,omitempty"`
+		}{ID: one.ID, Title: one.Title, Kind: one.Kind, Status: one.Status}
+	case agent.ToolCallProgressed:
+		name = "tool_call_progressed"
+		payload = struct {
+			ID     string `json:"id"`
+			Title  string `json:"title,omitempty"`
+			Status string `json:"status,omitempty"`
+		}{ID: one.ID, Title: one.Title, Status: one.Status}
+	case agent.PermissionRequested:
+		name = "permission_requested"
+		options := make([]permissionOptionEvent, 0, len(one.Options))
+		for _, option := range one.Options {
+			options = append(options, permissionOptionEvent{
+				ID: option.ID, Name: option.Name, Kind: option.Kind,
+			})
+		}
+		payload = struct {
+			ID         string                  `json:"id"`
+			ToolCallID string                  `json:"tool_call_id"`
+			Title      string                  `json:"title"`
+			Kind       string                  `json:"kind,omitempty"`
+			Input      any                     `json:"input"`
+			Options    []permissionOptionEvent `json:"options"`
+		}{
+			ID: one.ID, ToolCallID: one.ToolCallID, Title: one.Title,
+			Kind: one.Kind, Input: one.Input, Options: options,
+		}
+	case agent.PermissionResolved:
+		name = "permission_resolved"
+		payload = struct {
+			ID        string `json:"id"`
+			OptionID  string `json:"option_id,omitempty"`
+			TimedOut  bool   `json:"timed_out,omitempty"`
+			Cancelled bool   `json:"cancelled,omitempty"`
+		}{
+			ID: one.ID, OptionID: one.OptionID,
+			TimedOut: one.TimedOut, Cancelled: one.Cancelled,
+		}
+	case agent.Crashed:
+		name = "crashed"
+		payload = struct {
+			Error string `json:"error"`
+		}{Error: one.Error}
+	default:
+		return serverEvent{}, false, nil
+	}
+	data, err := json.Marshal(payload)
+	return serverEvent{name: name, data: data}, true, err
 }

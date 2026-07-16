@@ -286,9 +286,9 @@ func (m *Manager) Create(ctx context.Context, create Create) (Record, error) {
 	}
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.closed {
 		_, demoteErr := m.db.ExecContext(ctx, `UPDATE sessions SET state = ? WHERE id = ?`, Dormant, id)
+		m.mu.Unlock()
 		return Record{}, errors.Join(
 			fmt.Errorf("create Session: %w", ErrClosed),
 			closeAgent(conn),
@@ -300,6 +300,8 @@ func (m *Manager) Create(ctx context.Context, create Create) (Record, error) {
 	managed.mu.Lock()
 	m.armIdleLocked(id, managed)
 	managed.mu.Unlock()
+	m.mu.Unlock()
+	m.surfaceState(id, Live)
 	go m.watchConnection(id, managed, conn)
 	return record, nil
 }
@@ -453,7 +455,7 @@ func (m *Manager) recordBackgroundError(err error) {
 	m.backgroundErr = errors.Join(m.backgroundErr, err)
 }
 
-func (m *Manager) runPrompt(ctx context.Context, id string, managed *managedSession, call *promptCall) (agent.StopReason, error) {
+func (m *Manager) runPrompt(ctx context.Context, id string, managed *managedSession, call *promptCall) (stop agent.StopReason, returnErr error) {
 	turnCtx, cancel := context.WithCancel(ctx)
 	stopLifecycleCancel := context.AfterFunc(m.ctx, cancel)
 	defer func() {
@@ -463,6 +465,24 @@ func (m *Manager) runPrompt(ctx context.Context, id string, managed *managedSess
 	if m.ctx.Err() != nil {
 		return "", ErrClosed
 	}
+	if err := m.sendLifecycle(turnCtx, channel.LifecycleEvent{
+		SessionID:    id,
+		SessionEvent: channel.PromptStarted{Prompt: call.text},
+	}); err != nil {
+		return "", err
+	}
+	defer func() {
+		finished := channel.PromptFinished{StopReason: stop}
+		if returnErr != nil {
+			finished.Error = returnErr.Error()
+		}
+		if err := m.sendLifecycle(m.ctx, channel.LifecycleEvent{
+			SessionID:    id,
+			SessionEvent: finished,
+		}); err != nil && m.ctx.Err() == nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("finish Prompt lifecycle for Session %q: %w", id, err))
+		}
+	}()
 
 	conn, err := m.liveConnection(turnCtx, id, managed)
 	if err != nil {
@@ -471,7 +491,7 @@ func (m *Manager) runPrompt(ctx context.Context, id string, managed *managedSess
 		}
 		return "", err
 	}
-	stop, err := conn.Prompt(turnCtx, managed.agentSessionID, call.text)
+	stop, err = conn.Prompt(turnCtx, managed.agentSessionID, call.text)
 	if m.ctx.Err() != nil {
 		return "", ErrClosed
 	}
@@ -503,17 +523,38 @@ func (m *Manager) runPrompt(ctx context.Context, id string, managed *managedSess
 	return stop, nil
 }
 
+func (m *Manager) sendLifecycle(ctx context.Context, event channel.LifecycleEvent) error {
+	lifecycle, ok := m.channel.(channel.LifecycleChannel)
+	if !ok {
+		return nil
+	}
+	return lifecycle.SendLifecycle(ctx, event)
+}
+
+func (m *Manager) surfaceState(id string, state State) {
+	if err := m.sendLifecycle(m.ctx, channel.LifecycleEvent{
+		SessionID:    id,
+		SessionEvent: channel.SessionStateChanged{State: string(state)},
+	}); err != nil && m.ctx.Err() == nil {
+		m.recordBackgroundError(fmt.Errorf("surface %s state for Session %q: %w", state, id, err))
+	}
+}
+
 func (m *Manager) liveConnection(ctx context.Context, id string, managed *managedSession) (*agent.Conn, error) {
 	managed.mu.Lock()
-	defer managed.mu.Unlock()
 	if managed.closing {
+		managed.mu.Unlock()
 		return nil, ErrSessionClosed
 	}
 	if managed.conn != nil {
-		return managed.conn, nil
+		conn := managed.conn
+		managed.mu.Unlock()
+		return conn, nil
 	}
 	if !managed.record.State.CanTransitionTo(Live) {
-		return nil, fmt.Errorf("resume Session %q from %q: %w", id, managed.record.State, ErrInvalidTransition)
+		state := managed.record.State
+		managed.mu.Unlock()
+		return nil, fmt.Errorf("resume Session %q from %q: %w", id, state, ErrInvalidTransition)
 	}
 
 	var resuming atomic.Bool
@@ -528,13 +569,17 @@ func (m *Manager) liveConnection(ctx context.Context, id string, managed *manage
 		Permission: m.permissionHandler(id),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("connect Agent %q: %w", managed.record.Agent, err)
+		connectErr := fmt.Errorf("connect Agent %q: %w", managed.record.Agent, err)
+		managed.mu.Unlock()
+		return nil, connectErr
 	}
 	if err := conn.ResumeSession(ctx, managed.agentSessionID, managed.record.Workspace); err != nil {
+		managed.mu.Unlock()
 		return nil, errors.Join(err, closeAgent(conn))
 	}
 	resuming.Store(false)
 	if _, err := m.db.ExecContext(ctx, `UPDATE sessions SET state = ? WHERE id = ?`, Live, id); err != nil {
+		managed.mu.Unlock()
 		return nil, errors.Join(
 			fmt.Errorf("mark Session %q live: %w", id, err),
 			closeAgent(conn),
@@ -542,6 +587,8 @@ func (m *Manager) liveConnection(ctx context.Context, id string, managed *manage
 	}
 	managed.conn = conn
 	managed.record.State = Live
+	managed.mu.Unlock()
+	m.surfaceState(id, Live)
 	go m.watchConnection(id, managed, conn)
 	return conn, nil
 }
@@ -577,6 +624,7 @@ func (m *Manager) connectionEnded(id string, managed *managedSession, conn *agen
 	managed.record.LastActivityAt = now
 	managed.mu.Unlock()
 	m.mu.Unlock()
+	m.surfaceState(id, Dormant)
 
 	exitErr := conn.ExitError()
 	if err := closeAgent(conn); err != nil {
@@ -745,8 +793,14 @@ func (m *Manager) CloseSession(ctx context.Context, id string) (Record, error) {
 		select {
 		case <-current.done:
 		case <-ctx.Done():
-			return record, errors.Join(closeErr, ctx.Err())
+			closeErr = errors.Join(closeErr, ctx.Err())
 		}
+	}
+	if err := m.sendLifecycle(m.ctx, channel.LifecycleEvent{
+		SessionID:    id,
+		SessionEvent: channel.SessionStateChanged{State: string(Closed)},
+	}); err != nil && m.ctx.Err() == nil {
+		closeErr = errors.Join(closeErr, fmt.Errorf("surface closed state for Session %q: %w", id, err))
 	}
 	return record, closeErr
 }
@@ -852,6 +906,7 @@ func (m *Manager) demoteIdle(id string, managed *managedSession) {
 		m.backgroundErr = errors.Join(m.backgroundErr, fmt.Errorf("demote idle Session %q: %w", id, err))
 		m.mu.Unlock()
 	}
+	m.surfaceState(id, Dormant)
 }
 
 func (m *Manager) load(ctx context.Context) (returnErr error) {

@@ -1,20 +1,375 @@
 package rest_test
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aesoteric/aethos/internal/agent"
+	"github.com/aesoteric/aethos/internal/channel"
 	"github.com/aesoteric/aethos/internal/rest"
 	"github.com/aesoteric/aethos/internal/session"
 )
+
+func TestClientStreamsAgentOutputAsItHappens(t *testing.T) {
+	api, manager := openRESTFlow(t, &agent.Script{Turns: []agent.Turn{{
+		WantPrompt: "inspect the config",
+		Events: []agent.Event{
+			agent.Thought{Text: "Considering the config."},
+			agent.ToolCallBegan{ID: "tool-1", Title: "Read config", Kind: "read", Status: "in_progress"},
+			agent.ToolCallProgressed{ID: "tool-1", Title: "Read config", Status: "completed"},
+			agent.Message{Text: "The config is valid."},
+		},
+		Stop: agent.StopEndTurn,
+	}}})
+	handler := api.Handler(manager)
+	sessionID := createSession(t, handler, t.TempDir())
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	defer server.CloseClientConnections()
+
+	streamCtx, cancelStream := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancelStream()
+	stream := openEventStream(t, streamCtx, server.URL+"/sessions/"+sessionID+"/events")
+	defer stream.Body.Close()
+
+	prompted := make(chan *http.Response, 1)
+	go func() {
+		prompted <- serverRequest(t, server.Client(), http.MethodPost, server.URL+"/sessions/"+sessionID+"/prompt", map[string]string{
+			"prompt": "inspect the config",
+		})
+	}()
+
+	reader := bufio.NewReader(stream.Body)
+	want := []struct {
+		name string
+		data string
+	}{
+		{name: "prompt_started", data: `{"prompt":"inspect the config"}`},
+		{name: "thought", data: `{"text":"Considering the config."}`},
+		{name: "tool_call_began", data: `{"id":"tool-1","title":"Read config","kind":"read","status":"in_progress"}`},
+		{name: "tool_call_progressed", data: `{"id":"tool-1","title":"Read config","status":"completed"}`},
+		{name: "message", data: `{"text":"The config is valid."}`},
+		{name: "prompt_finished", data: `{"stop_reason":"end_turn"}`},
+	}
+	for _, expected := range want {
+		got := readEvent(t, reader)
+		if got.name != expected.name {
+			t.Fatalf("SSE event name = %q, want %q", got.name, expected.name)
+		}
+		if string(got.data) != expected.data {
+			t.Errorf("%s SSE data = %s, want %s", got.name, got.data, expected.data)
+		}
+	}
+
+	response := <-prompted
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("POST Prompt status = %d, want %d", response.StatusCode, http.StatusOK)
+	}
+}
+
+func TestClientStreamsPromptLifecycle(t *testing.T) {
+	api, manager := openRESTFlow(t, &agent.Script{Turns: []agent.Turn{{
+		WantPrompt: "ship it",
+		Stop:       agent.StopEndTurn,
+	}}})
+	handler := api.Handler(manager)
+	sessionID := createSession(t, handler, t.TempDir())
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	defer server.CloseClientConnections()
+
+	streamCtx, cancelStream := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancelStream()
+	stream := openEventStream(t, streamCtx, server.URL+"/sessions/"+sessionID+"/events")
+	defer stream.Body.Close()
+
+	prompted := make(chan *http.Response, 1)
+	go func() {
+		prompted <- serverRequest(t, server.Client(), http.MethodPost, server.URL+"/sessions/"+sessionID+"/prompt", map[string]string{
+			"prompt": "ship it",
+		})
+	}()
+
+	reader := bufio.NewReader(stream.Body)
+	started := readEvent(t, reader)
+	if started.name != "prompt_started" || string(started.data) != `{"prompt":"ship it"}` {
+		t.Errorf("started Prompt event = %q %s, want prompt_started with Prompt text", started.name, started.data)
+	}
+	finished := readEvent(t, reader)
+	if finished.name != "prompt_finished" || string(finished.data) != `{"stop_reason":"end_turn"}` {
+		t.Errorf("finished Prompt event = %q %s, want prompt_finished with stop reason", finished.name, finished.data)
+	}
+
+	response := <-prompted
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("POST Prompt status = %d, want %d", response.StatusCode, http.StatusOK)
+	}
+}
+
+func TestClientAnswersStreamedPermissionAndAgentProceeds(t *testing.T) {
+	api, manager := openRESTFlow(t, &agent.Script{Turns: []agent.Turn{{
+		WantPrompt: "update the config",
+		Permissions: []agent.ScriptedPermission{{
+			Request: agent.PermissionRequest{
+				ToolCallID: "tool-1",
+				Title:      "Edit config",
+				Kind:       "edit",
+				Input:      map[string]any{"path": "config.toml"},
+				Options: []agent.PermissionOption{
+					{ID: "allow-once", Name: "Allow once", Kind: agent.PermissionAllowOnce},
+					{ID: "reject-once", Name: "Reject", Kind: agent.PermissionRejectOnce},
+				},
+			},
+			WantOptionID: "allow-once",
+		}},
+		Events: []agent.Event{agent.Message{Text: "Config updated."}},
+		Stop:   agent.StopEndTurn,
+	}}})
+	handler := api.Handler(manager)
+	sessionID := createSession(t, handler, t.TempDir())
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	defer server.CloseClientConnections()
+
+	streamCtx, cancelStream := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancelStream()
+	stream := openEventStream(t, streamCtx, server.URL+"/sessions/"+sessionID+"/events")
+	defer stream.Body.Close()
+
+	prompted := make(chan *http.Response, 1)
+	go func() {
+		prompted <- serverRequest(t, server.Client(), http.MethodPost, server.URL+"/sessions/"+sessionID+"/prompt", map[string]string{
+			"prompt": "update the config",
+		})
+	}()
+
+	reader := bufio.NewReader(stream.Body)
+	if started := readEvent(t, reader); started.name != "prompt_started" {
+		t.Fatalf("first SSE event = %q, want prompt_started", started.name)
+	}
+	requested := readEvent(t, reader)
+	if requested.name != "permission_requested" {
+		t.Fatalf("second SSE event = %q, want permission_requested", requested.name)
+	}
+	var permission struct {
+		ID         string `json:"id"`
+		ToolCallID string `json:"tool_call_id"`
+		Title      string `json:"title"`
+		Kind       string `json:"kind"`
+		Input      struct {
+			Path string `json:"path"`
+		} `json:"input"`
+		Options []struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+			Kind string `json:"kind"`
+		} `json:"options"`
+	}
+	if err := json.Unmarshal(requested.data, &permission); err != nil {
+		t.Fatalf("decode permission request event: %v", err)
+	}
+	if permission.ID == "" || permission.ToolCallID != "tool-1" || permission.Title != "Edit config" ||
+		permission.Kind != "edit" || permission.Input.Path != "config.toml" || len(permission.Options) != 2 ||
+		permission.Options[0].ID != "allow-once" || permission.Options[0].Name != "Allow once" || permission.Options[0].Kind != "allow_once" {
+		t.Fatalf("permission request = %#v, want Agent request identity, input, and options", permission)
+	}
+	rejected := serverRequest(t, server.Client(), http.MethodPost, server.URL+"/permissions/"+permission.ID, map[string]string{
+		"option_id": "not-offered",
+	})
+	rejected.Body.Close()
+	if rejected.StatusCode != http.StatusBadRequest {
+		t.Fatalf("unoffered permission option status = %d, want %d", rejected.StatusCode, http.StatusBadRequest)
+	}
+
+	for attempt := 0; attempt < 2; attempt++ {
+		answered := serverRequest(t, server.Client(), http.MethodPost, server.URL+"/permissions/"+permission.ID, map[string]string{
+			"option_id": "allow-once",
+		})
+		answered.Body.Close()
+		if answered.StatusCode != http.StatusOK {
+			t.Fatalf("permission answer %d status = %d, want %d", attempt+1, answered.StatusCode, http.StatusOK)
+		}
+	}
+
+	resolved := readEvent(t, reader)
+	wantResolved := `{"id":"` + permission.ID + `","option_id":"allow-once"}`
+	if resolved.name != "permission_resolved" || string(resolved.data) != wantResolved {
+		t.Errorf("resolved permission event = %q %s, want permission_resolved %s", resolved.name, resolved.data, wantResolved)
+	}
+	message := readEvent(t, reader)
+	if message.name != "message" || string(message.data) != `{"text":"Config updated."}` {
+		t.Errorf("post-permission event = %q %s, want Agent message", message.name, message.data)
+	}
+	if finished := readEvent(t, reader); finished.name != "prompt_finished" {
+		t.Errorf("final SSE event = %q, want prompt_finished", finished.name)
+	}
+
+	response := <-prompted
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("POST Prompt status = %d, want %d", response.StatusCode, http.StatusOK)
+	}
+}
+
+func TestEventStreamEndsWhenSessionCloses(t *testing.T) {
+	api, manager := openRESTFlow(t, &agent.Script{})
+	handler := api.Handler(manager)
+	sessionID := createSession(t, handler, t.TempDir())
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	defer server.CloseClientConnections()
+
+	streamCtx, cancelStream := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancelStream()
+	stream := openEventStream(t, streamCtx, server.URL+"/sessions/"+sessionID+"/events")
+	defer stream.Body.Close()
+
+	if _, err := manager.CloseSession(t.Context(), sessionID); err != nil {
+		t.Fatalf("close Session: %v", err)
+	}
+	reader := bufio.NewReader(stream.Body)
+	closed := readEvent(t, reader)
+	if closed.name != "session_state_changed" || string(closed.data) != `{"state":"closed"}` {
+		t.Errorf("closed Session event = %q %s, want terminal closed state", closed.name, closed.data)
+	}
+	if _, err := reader.ReadByte(); !errors.Is(err, io.EOF) {
+		t.Errorf("read after closed Session event = %v, want EOF", err)
+	}
+	reopened := request(t, handler, http.MethodGet, "/sessions/"+sessionID+"/events", "test-token", nil)
+	defer reopened.Body.Close()
+	if reopened.StatusCode != http.StatusConflict {
+		t.Errorf("closed Session event stream status = %d, want %d", reopened.StatusCode, http.StatusConflict)
+	}
+}
+
+func TestClientStreamsDormantAndLiveStateChanges(t *testing.T) {
+	api, manager := openRESTFlow(t, &agent.Script{Turns: []agent.Turn{
+		{WantPrompt: "crash", Crash: true},
+		{WantPrompt: "resume", Events: []agent.Event{agent.Message{Text: "Back online."}}, Stop: agent.StopEndTurn},
+	}})
+	handler := api.Handler(manager)
+	sessionID := createSession(t, handler, t.TempDir())
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	defer server.CloseClientConnections()
+
+	streamCtx, cancelStream := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancelStream()
+	stream := openEventStream(t, streamCtx, server.URL+"/sessions/"+sessionID+"/events")
+	defer stream.Body.Close()
+	reader := bufio.NewReader(stream.Body)
+
+	crashedPrompt := make(chan *http.Response, 1)
+	go func() {
+		crashedPrompt <- serverRequest(t, server.Client(), http.MethodPost, server.URL+"/sessions/"+sessionID+"/prompt", map[string]string{"prompt": "crash"})
+	}()
+	for index, name := range []string{"prompt_started", "session_state_changed", "crashed", "prompt_finished"} {
+		event := readEvent(t, reader)
+		if event.name != name {
+			t.Fatalf("crash SSE event %d = %q, want %q", index+1, event.name, name)
+		}
+		if name == "session_state_changed" && string(event.data) != `{"state":"dormant"}` {
+			t.Errorf("crash state event = %s, want dormant", event.data)
+		}
+	}
+	crashedResponse := <-crashedPrompt
+	crashedResponse.Body.Close()
+	if crashedResponse.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("crashed Prompt status = %d, want %d", crashedResponse.StatusCode, http.StatusInternalServerError)
+	}
+
+	resumedPrompt := make(chan *http.Response, 1)
+	go func() {
+		resumedPrompt <- serverRequest(t, server.Client(), http.MethodPost, server.URL+"/sessions/"+sessionID+"/prompt", map[string]string{"prompt": "resume"})
+	}()
+	for index, expected := range []struct {
+		name string
+		data string
+	}{
+		{name: "prompt_started", data: `{"prompt":"resume"}`},
+		{name: "session_state_changed", data: `{"state":"live"}`},
+		{name: "message", data: `{"text":"Back online."}`},
+		{name: "prompt_finished", data: `{"stop_reason":"end_turn"}`},
+	} {
+		event := readEvent(t, reader)
+		if event.name != expected.name || string(event.data) != expected.data {
+			t.Fatalf("resume SSE event %d = %q %s, want %q %s", index+1, event.name, event.data, expected.name, expected.data)
+		}
+	}
+	resumedResponse := <-resumedPrompt
+	defer resumedResponse.Body.Close()
+	if resumedResponse.StatusCode != http.StatusOK {
+		t.Fatalf("resumed Prompt status = %d, want %d", resumedResponse.StatusCode, http.StatusOK)
+	}
+}
+
+func TestReconnectingClientReceivesOnlySubsequentEvents(t *testing.T) {
+	api, manager := openRESTFlow(t, &agent.Script{Turns: []agent.Turn{
+		{WantPrompt: "first", Events: []agent.Event{agent.Message{Text: "First result."}}, Stop: agent.StopEndTurn},
+		{WantPrompt: "second", Events: []agent.Event{agent.Message{Text: "Second result."}}, Stop: agent.StopEndTurn},
+	}})
+	handler := api.Handler(manager)
+	sessionID := createSession(t, handler, t.TempDir())
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	defer server.CloseClientConnections()
+
+	firstCtx, cancelFirst := context.WithCancel(t.Context())
+	firstStream := openEventStream(t, firstCtx, server.URL+"/sessions/"+sessionID+"/events")
+	firstPrompt := make(chan *http.Response, 1)
+	go func() {
+		firstPrompt <- serverRequest(t, server.Client(), http.MethodPost, server.URL+"/sessions/"+sessionID+"/prompt", map[string]string{"prompt": "first"})
+	}()
+	firstReader := bufio.NewReader(firstStream.Body)
+	for _, name := range []string{"prompt_started", "message", "prompt_finished"} {
+		if event := readEvent(t, firstReader); event.name != name {
+			t.Fatalf("first connection event = %q, want %q", event.name, name)
+		}
+	}
+	firstResponse := <-firstPrompt
+	firstResponse.Body.Close()
+	cancelFirst()
+	firstStream.Body.Close()
+
+	secondCtx, cancelSecond := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancelSecond()
+	secondStream := openEventStream(t, secondCtx, server.URL+"/sessions/"+sessionID+"/events")
+	defer secondStream.Body.Close()
+	secondPrompt := make(chan *http.Response, 1)
+	go func() {
+		secondPrompt <- serverRequest(t, server.Client(), http.MethodPost, server.URL+"/sessions/"+sessionID+"/prompt", map[string]string{"prompt": "second"})
+	}()
+
+	secondReader := bufio.NewReader(secondStream.Body)
+	started := readEvent(t, secondReader)
+	if started.name != "prompt_started" || string(started.data) != `{"prompt":"second"}` {
+		t.Fatalf("first reconnected event = %q %s, want subsequent Prompt only", started.name, started.data)
+	}
+	message := readEvent(t, secondReader)
+	if message.name != "message" || string(message.data) != `{"text":"Second result."}` {
+		t.Fatalf("reconnected Agent event = %q %s, want second result", message.name, message.data)
+	}
+	if finished := readEvent(t, secondReader); finished.name != "prompt_finished" {
+		t.Fatalf("last reconnected event = %q, want prompt_finished", finished.name)
+	}
+	secondResponse := <-secondPrompt
+	defer secondResponse.Body.Close()
+	if secondResponse.StatusCode != http.StatusOK {
+		t.Fatalf("second Prompt status = %d, want %d", secondResponse.StatusCode, http.StatusOK)
+	}
+}
 
 func TestAuthenticatedClientCreatesSession(t *testing.T) {
 	api, manager := openRESTFlow(t, &agent.Script{})
@@ -105,8 +460,10 @@ func TestEverySessionRouteRequiresBearerToken(t *testing.T) {
 		{method: http.MethodPost, path: "/sessions"},
 		{method: http.MethodGet, path: "/sessions"},
 		{method: http.MethodGet, path: "/sessions/id"},
+		{method: http.MethodGet, path: "/sessions/id/events"},
 		{method: http.MethodPost, path: "/sessions/id/prompt"},
 		{method: http.MethodPost, path: "/sessions/id/cancel"},
+		{method: http.MethodPost, path: "/permissions/id"},
 	}
 	for _, route := range routes {
 		for _, token := range []string{"", "wrong-token"} {
@@ -339,6 +696,19 @@ func TestFailuresUseSpecificStatusesAndHumanReadableJSON(t *testing.T) {
 			want:   http.StatusNotFound,
 		},
 		{
+			name:   "unknown Session event stream",
+			method: http.MethodGet,
+			path:   "/sessions/unknown/events",
+			want:   http.StatusNotFound,
+		},
+		{
+			name:   "unknown permission request",
+			method: http.MethodPost,
+			path:   "/permissions/unknown",
+			body:   map[string]string{"option_id": "allow-once"},
+			want:   http.StatusNotFound,
+		},
+		{
 			name:   "conflicting cancel",
 			method: http.MethodPost,
 			path:   "/sessions/" + sessionID + "/cancel",
@@ -399,7 +769,18 @@ func openRESTFlow(t *testing.T, script *agent.Script) (*rest.Channel, *session.M
 	connect := func(ctx context.Context, _ string, handlers agent.Handlers) (*agent.Conn, error) {
 		return agent.ConnectScript(ctx, slog.New(slog.DiscardHandler), handlers, script)
 	}
-	manager, err := session.Open(t.Context(), t.TempDir()+"/aethos.db", connect, api)
+	var manager *session.Manager
+	events, err := channel.NewRouter(
+		func(ctx context.Context, sessionID string) (string, error) {
+			record, lookupErr := manager.Get(ctx, sessionID)
+			return record.Owner.Channel, lookupErr
+		},
+		map[string]channel.Channel{"rest": api},
+	)
+	if err != nil {
+		t.Fatalf("open Channel router: %v", err)
+	}
+	manager, err = session.Open(t.Context(), t.TempDir()+"/aethos.db", connect, events)
 	if err != nil {
 		t.Fatalf("open Session manager: %v", err)
 	}
@@ -430,6 +811,76 @@ func rawRequest(handler http.Handler, method, path, token, body string) *http.Re
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, req)
 	return recorder.Result()
+}
+
+func serverRequest(t *testing.T, client *http.Client, method, url string, body any) *http.Response {
+	t.Helper()
+	var encoded io.Reader
+	if body != nil {
+		var buffer bytes.Buffer
+		if err := json.NewEncoder(&buffer).Encode(body); err != nil {
+			t.Fatalf("encode server request body: %v", err)
+		}
+		encoded = &buffer
+	}
+	req, err := http.NewRequest(method, url, encoded)
+	if err != nil {
+		t.Fatalf("build server request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer test-token")
+	response, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("send server request: %v", err)
+	}
+	return response
+}
+
+func openEventStream(t *testing.T, ctx context.Context, url string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatalf("build SSE request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer test-token")
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("open SSE stream: %v", err)
+	}
+	if response.StatusCode != http.StatusOK {
+		defer response.Body.Close()
+		body, _ := io.ReadAll(response.Body)
+		t.Fatalf("GET event stream status = %d, want %d: %s", response.StatusCode, http.StatusOK, body)
+	}
+	if got := response.Header.Get("Content-Type"); got != "text/event-stream" {
+		response.Body.Close()
+		t.Fatalf("event stream Content-Type = %q, want text/event-stream", got)
+	}
+	return response
+}
+
+type receivedEvent struct {
+	name string
+	data json.RawMessage
+}
+
+func readEvent(t *testing.T, reader *bufio.Reader) receivedEvent {
+	t.Helper()
+	var event receivedEvent
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read SSE event: %v", err)
+		}
+		line = strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
+		switch {
+		case line == "" && event.name != "":
+			return event
+		case strings.HasPrefix(line, "event: "):
+			event.name = strings.TrimPrefix(line, "event: ")
+		case strings.HasPrefix(line, "data: "):
+			event.data = append(event.data, strings.TrimPrefix(line, "data: ")...)
+		}
+	}
 }
 
 func createSession(t *testing.T, handler http.Handler, workspace string) string {

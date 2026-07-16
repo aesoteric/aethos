@@ -92,14 +92,30 @@ and reports whether Session control is ready. Every other route requires
 - `POST /sessions` with `{"agent":"...","workspace":"/absolute/path"}`
 - `GET /sessions`
 - `GET /sessions/{id}`
+- `GET /sessions/{id}/events` (SSE)
 - `POST /sessions/{id}/prompt` with `{"prompt":"..."}`
 - `POST /sessions/{id}/cancel`
+- `POST /permissions/{request-id}` with `{"option_id":"..."}`
 
 REST-created Sessions record `rest/api` as their owner. Prompt requests wait
 for the Agent turn to finish and return its stop reason. Failures use JSON error
 bodies with 400 (validation), 401 (authentication), 404 (unknown Session), 409
 (conflicting Session state), or 500 (internal failure), never a successful
 status for failed work.
+
+The event stream is scoped to one Session and uses named SSE events. It emits
+`prompt_started` and `prompt_finished`, `thought` and `message` output,
+`tool_call_began` and `tool_call_progressed`, `permission_requested` and
+`permission_resolved`, `session_state_changed`, and `crashed`. Permission
+request data includes the request ID, tool description and input, and every
+Agent-provided option; send the selected option ID to the permission endpoint.
+Repeated answers to an already completed request are successful and harmless.
+
+SSE delivery is live-only in v1. A reconnect receives events published after
+the new connection is established; events missed while disconnected are not
+replayed. A `session_state_changed` event with `{"state":"closed"}` is the final
+event when a Session is deliberately closed, after which the server ends the
+stream cleanly.
 
 ## Session durability
 
