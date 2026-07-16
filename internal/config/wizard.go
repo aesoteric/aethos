@@ -57,10 +57,15 @@ func RunWizard(
 	if err != nil {
 		return Config{}, err
 	}
+	restToken, restTokenFromEnvironment, err := interaction.collectSecret(restTokenEnv, "REST bearer token: ")
+	if err != nil {
+		return Config{}, err
+	}
 
 	effective := defaultConfig()
 	effective.Workspace = workspace
 	effective.DefaultAgent = defaultAgent
+	effective.REST.BearerToken = restToken
 	effective.Telegram.BotToken = token
 	effective.Telegram.ChatID = chatID
 	effective.Telegram.AllowedUserIDs = allowedUserIDs
@@ -71,6 +76,9 @@ func RunWizard(
 	persisted := effective
 	if tokenFromEnvironment {
 		persisted.Telegram.BotToken = ""
+	}
+	if restTokenFromEnvironment {
+		persisted.REST.BearerToken = ""
 	}
 	if err := writeCommentedConfig(paths, persisted); err != nil {
 		return Config{}, err
@@ -220,6 +228,14 @@ func (i wizardInteraction) collectValue(envName, question string) (string, error
 	}
 }
 
+func (i wizardInteraction) collectSecret(envName, question string) (value string, fromEnvironment bool, err error) {
+	if value, ok := nonEmptyEnvironment(envName); ok {
+		return value, true, nil
+	}
+	value, err = i.collectValue(envName, question)
+	return value, false, err
+}
+
 func (i wizardInteraction) prompt(question string) (string, error) {
 	fmt.Fprint(i.output, question)
 	line, err := i.reader.ReadString('\n')
@@ -257,6 +273,10 @@ func writeCommentedConfig(paths Paths, cfg Config) error {
 # permissions.timeout denies unanswered risky actions after the deadline.
 # permissions.auto_approve lists exact Agent tool kinds, such as "read", that
 # are allowed without asking; leave it empty to ask every time.
+# REST listen_address selects the REST Channel's HTTP socket and defaults to
+# loopback. bearer_token authenticates every endpoint except health. For
+# secret-managed deployments, leave it empty and set AETHOS_REST_BEARER_TOKEN.
+# AETHOS_REST_LISTEN_ADDRESS overrides the REST socket.
 # Telegram bot_token authenticates the Telegram Channel. For containers and
 # other secret-managed deployments, leave it empty and set
 # AETHOS_TELEGRAM_BOT_TOKEN instead. AETHOS_WORKSPACE and

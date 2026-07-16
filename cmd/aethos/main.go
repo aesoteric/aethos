@@ -18,7 +18,9 @@ import (
 	"time"
 
 	"github.com/aesoteric/aethos/internal/agent"
+	channeltypes "github.com/aesoteric/aethos/internal/channel"
 	"github.com/aesoteric/aethos/internal/config"
+	"github.com/aesoteric/aethos/internal/rest"
 	"github.com/aesoteric/aethos/internal/session"
 	"github.com/aesoteric/aethos/internal/telegram"
 )
@@ -144,11 +146,33 @@ func run(
 	if err != nil {
 		return err
 	}
-	manager, err := session.Open(
+	api, err := rest.New(rest.Settings{
+		ListenAddress: configured.REST.ListenAddress,
+		BearerToken:   configured.REST.BearerToken,
+		Identity:      "api",
+	}, logger)
+	if err != nil {
+		return errors.Join(err, bridge.Close())
+	}
+	var manager *session.Manager
+	events, err := channeltypes.NewRouter(
+		func(eventCtx context.Context, sessionID string) (string, error) {
+			record, lookupErr := manager.Get(eventCtx, sessionID)
+			return record.Owner.Channel, lookupErr
+		},
+		map[string]channeltypes.Channel{
+			"rest":     api,
+			"telegram": bridge,
+		},
+	)
+	if err != nil {
+		return errors.Join(err, bridge.Close())
+	}
+	manager, err = session.Open(
 		ctx,
 		paths.DatabaseFile,
 		agentConnector(logger),
-		bridge,
+		events,
 		session.WithIdleTimeout(time.Duration(configured.IdleTimeout)),
 		session.WithPermissionTimeout(time.Duration(configured.Permissions.Timeout)),
 		session.WithAutoApprove(configured.Permissions.AutoApprove...),
@@ -156,8 +180,20 @@ func run(
 	if err != nil {
 		return errors.Join(err, bridge.Close())
 	}
-	runErr := bridge.Run(ctx, manager)
+	runErr := runChannels(ctx, bridge, api, manager)
 	return errors.Join(runErr, manager.Close(), bridge.Close())
+}
+
+func runChannels(ctx context.Context, telegramChannel *telegram.Channel, restChannel *rest.Channel, manager *session.Manager) error {
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	results := make(chan error, 2)
+	go func() { results <- telegramChannel.Run(runCtx, manager) }()
+	go func() { results <- restChannel.Run(runCtx, manager) }()
+	first := <-results
+	cancel()
+	second := <-results
+	return errors.Join(first, second)
 }
 
 // devPrompt is the hidden tracer-bullet command: spawn a locally

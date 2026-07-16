@@ -18,6 +18,10 @@ import (
 // without Prompt work when config.toml does not override it.
 const DefaultIdleTimeout = 30 * time.Minute
 
+// DefaultRESTListenAddress keeps the REST Channel on the loopback interface
+// unless the operator explicitly exposes it.
+const DefaultRESTListenAddress = "127.0.0.1:8080"
+
 // Duration is a TOML duration encoded with Go's human-readable duration
 // syntax, for example "30m" or "2h15m".
 type Duration time.Duration
@@ -40,6 +44,8 @@ func (duration Duration) MarshalText() ([]byte, error) {
 const (
 	dataDirEnv      = "AETHOS_DATA_DIR"
 	botTokenEnv     = "AETHOS_TELEGRAM_BOT_TOKEN"
+	restListenEnv   = "AETHOS_REST_LISTEN_ADDRESS"
+	restTokenEnv    = "AETHOS_REST_BEARER_TOKEN"
 	workspaceEnv    = "AETHOS_WORKSPACE"
 	defaultAgentEnv = "AETHOS_DEFAULT_AGENT"
 )
@@ -59,6 +65,12 @@ type Telegram struct {
 	AllowedUserIDs []int64 `toml:"allowed_user_ids"`
 }
 
+// REST holds configuration for the automation-facing HTTP Channel.
+type REST struct {
+	ListenAddress string `toml:"listen_address"`
+	BearerToken   string `toml:"bearer_token"`
+}
+
 // Permissions configures the fail-safe deadline and exact Agent tool kinds
 // that the permission gate may approve without Channel interaction.
 type Permissions struct {
@@ -72,6 +84,7 @@ type Config struct {
 	DefaultAgent string      `toml:"default_agent"`
 	IdleTimeout  Duration    `toml:"idle_timeout"`
 	Permissions  Permissions `toml:"permissions"`
+	REST         REST        `toml:"rest"`
 	Telegram     Telegram    `toml:"telegram"`
 }
 
@@ -160,12 +173,19 @@ func defaultConfig() Config {
 	return Config{
 		IdleTimeout: Duration(DefaultIdleTimeout),
 		Permissions: Permissions{Timeout: Duration(permission.DefaultTimeout)},
+		REST:        REST{ListenAddress: DefaultRESTListenAddress},
 	}
 }
 
 func applyEnvironment(cfg *Config) {
 	if value, ok := os.LookupEnv(botTokenEnv); ok {
 		cfg.Telegram.BotToken = value
+	}
+	if value, ok := os.LookupEnv(restTokenEnv); ok {
+		cfg.REST.BearerToken = value
+	}
+	if value, ok := os.LookupEnv(restListenEnv); ok && strings.TrimSpace(value) != "" {
+		cfg.REST.ListenAddress = value
 	}
 	if value, ok := os.LookupEnv(workspaceEnv); ok {
 		cfg.Workspace = value
@@ -188,6 +208,12 @@ func (c Config) Validate() error {
 	}
 	if strings.TrimSpace(c.DefaultAgent) == "" {
 		return fmt.Errorf("default_agent is required (set it in config.toml or %s)", defaultAgentEnv)
+	}
+	if strings.TrimSpace(c.REST.ListenAddress) == "" {
+		return fmt.Errorf("rest.listen_address is required")
+	}
+	if strings.TrimSpace(c.REST.BearerToken) == "" {
+		return fmt.Errorf("rest.bearer_token is required (set it in config.toml or %s)", restTokenEnv)
 	}
 	if c.Telegram.ChatID == 0 {
 		return fmt.Errorf("telegram.chat_id is required")

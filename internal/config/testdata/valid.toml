@@ -7,6 +7,10 @@ default_agent = "npx @zed-industries/claude-code-acp"
 # Time with no Prompt work before a live Session becomes dormant.
 idle_timeout = "45m"
 
+[rest]
+listen_address = "127.0.0.1:9090"
+bearer_token = "file-rest-token"
+
 # Token used by the Telegram Channel.
 [telegram]
 bot_token = "file-token"

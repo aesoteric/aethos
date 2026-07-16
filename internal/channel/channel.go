@@ -5,6 +5,7 @@ package channel
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	"github.com/aesoteric/aethos/internal/agent"
@@ -19,6 +20,46 @@ type Event struct {
 // Channel delivers user-visible events for Sessions.
 type Channel interface {
 	Send(context.Context, Event) error
+}
+
+// OwnerLookup returns the owning Channel name for a Session.
+type OwnerLookup func(context.Context, string) (string, error)
+
+// Router sends each Session event only to the Channel recorded as its owner.
+type Router struct {
+	owner  OwnerLookup
+	routes map[string]Channel
+}
+
+// NewRouter builds an immutable owner-based Channel router.
+func NewRouter(owner OwnerLookup, routes map[string]Channel) (*Router, error) {
+	if owner == nil {
+		return nil, fmt.Errorf("session owner lookup is required")
+	}
+	if len(routes) == 0 {
+		return nil, fmt.Errorf("at least one Channel route is required")
+	}
+	copied := make(map[string]Channel, len(routes))
+	for name, target := range routes {
+		if name == "" || target == nil {
+			return nil, fmt.Errorf("Channel route name and target are required")
+		}
+		copied[name] = target
+	}
+	return &Router{owner: owner, routes: copied}, nil
+}
+
+// Send implements Channel.
+func (r *Router) Send(ctx context.Context, event Event) error {
+	owner, err := r.owner(ctx, event.SessionID)
+	if err != nil {
+		return err
+	}
+	target := r.routes[owner]
+	if target == nil {
+		return fmt.Errorf("no Channel registered for Session owner %q", owner)
+	}
+	return target.Send(ctx, event)
 }
 
 // Prompt is inbound text addressed to an existing Session.

@@ -78,6 +78,8 @@ func TestPathsKeepAllPersistentFilesUnderDataDir(t *testing.T) {
 
 func TestLoadReadsFixtureAndAppliesEnvironmentOverrides(t *testing.T) {
 	t.Setenv("AETHOS_TELEGRAM_BOT_TOKEN", "env-token")
+	t.Setenv("AETHOS_REST_BEARER_TOKEN", "env-rest-token")
+	t.Setenv("AETHOS_REST_LISTEN_ADDRESS", "127.0.0.1:9191")
 	t.Setenv("AETHOS_WORKSPACE", "/env/workspace")
 	t.Setenv("AETHOS_DEFAULT_AGENT", "env-agent")
 
@@ -88,6 +90,12 @@ func TestLoadReadsFixtureAndAppliesEnvironmentOverrides(t *testing.T) {
 
 	if got.Telegram.BotToken != "env-token" {
 		t.Errorf("Telegram.BotToken = %q, want environment override", got.Telegram.BotToken)
+	}
+	if got.REST.BearerToken != "env-rest-token" {
+		t.Errorf("REST.BearerToken = %q, want environment override", got.REST.BearerToken)
+	}
+	if got.REST.ListenAddress != "127.0.0.1:9191" {
+		t.Errorf("REST.ListenAddress = %q, want environment override", got.REST.ListenAddress)
 	}
 	if got.Workspace != "/env/workspace" {
 		t.Errorf("Workspace = %q, want environment override", got.Workspace)
@@ -107,6 +115,7 @@ func TestLoadReadsFixtureAndAppliesEnvironmentOverrides(t *testing.T) {
 }
 
 func TestLoadRequiresTelegramForumAndAllowlist(t *testing.T) {
+	t.Setenv("AETHOS_REST_BEARER_TOKEN", "rest-token")
 	tests := []struct {
 		name      string
 		telegram  string
@@ -150,6 +159,8 @@ bot_token = "token"
 
 func TestLoadDefaultsAndValidatesIdleTimeout(t *testing.T) {
 	t.Setenv("AETHOS_TELEGRAM_BOT_TOKEN", "token")
+	t.Setenv("AETHOS_REST_BEARER_TOKEN", "rest-token")
+	t.Setenv("AETHOS_REST_LISTEN_ADDRESS", "")
 	t.Setenv("AETHOS_WORKSPACE", "/workspace")
 	t.Setenv("AETHOS_DEFAULT_AGENT", "codex-acp")
 
@@ -165,6 +176,9 @@ func TestLoadDefaultsAndValidatesIdleTimeout(t *testing.T) {
 	if time.Duration(got.Permissions.Timeout) != 10*time.Minute {
 		t.Errorf("Permissions.Timeout = %s, want default 10m", time.Duration(got.Permissions.Timeout))
 	}
+	if got.REST.ListenAddress != config.DefaultRESTListenAddress {
+		t.Errorf("REST.ListenAddress = %q, want default %q", got.REST.ListenAddress, config.DefaultRESTListenAddress)
+	}
 
 	writeFixture(t, path, "idle_timeout = \"never\"\n[telegram]\nbot_token = \"\"\nchat_id = -1001\nallowed_user_ids = [123]\n")
 	if _, err := config.Load(path); err == nil || !strings.Contains(err.Error(), "idle_timeout") {
@@ -173,6 +187,7 @@ func TestLoadDefaultsAndValidatesIdleTimeout(t *testing.T) {
 }
 
 func TestLoadReadsAndValidatesPermissionPolicy(t *testing.T) {
+	t.Setenv("AETHOS_REST_BEARER_TOKEN", "rest-token")
 	path := filepath.Join(t.TempDir(), "config.toml")
 	writeFixture(t, path, `workspace = "/workspace"
 default_agent = "codex-acp"
@@ -216,6 +231,7 @@ allowed_user_ids = [123]
 
 func TestLoadAllowsBotTokenToExistOnlyInEnvironment(t *testing.T) {
 	t.Setenv("AETHOS_TELEGRAM_BOT_TOKEN", "env-only-token")
+	t.Setenv("AETHOS_REST_BEARER_TOKEN", "rest-token")
 
 	path := filepath.Join(t.TempDir(), "config.toml")
 	writeFixture(t, path, `workspace = "/workspace"
@@ -237,6 +253,7 @@ allowed_user_ids = [123]
 }
 
 func TestLoadReportsActionableConfigurationErrors(t *testing.T) {
+	t.Setenv("AETHOS_REST_BEARER_TOKEN", "rest-token")
 	tests := []struct {
 		name    string
 		fixture string

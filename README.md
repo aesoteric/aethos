@@ -55,6 +55,8 @@ The data directory defaults to `~/.aethos/`. Override it with
 and log paths are all rooted there. Environment values override the file:
 
 - `AETHOS_TELEGRAM_BOT_TOKEN` (keeps the token out of `config.toml`)
+- `AETHOS_REST_BEARER_TOKEN` (keeps the REST Channel token out of `config.toml`)
+- `AETHOS_REST_LISTEN_ADDRESS` (overrides the default `127.0.0.1:8080` socket)
 - `AETHOS_WORKSPACE`
 - `AETHOS_DEFAULT_AGENT`
 
@@ -79,6 +81,25 @@ replace those buttons with their outcome; unanswered requests deny fail-safe.
 
 Invalid TOML, unknown fields, and missing required values stop startup with an
 actionable error.
+
+## REST automation
+
+The REST Channel listens on `127.0.0.1:8080` by default. `GET /health` is public
+and reports whether Session control is ready. Every other route requires
+`Authorization: Bearer <token>` using `[rest].bearer_token` or
+`AETHOS_REST_BEARER_TOKEN`:
+
+- `POST /sessions` with `{"agent":"...","workspace":"/absolute/path"}`
+- `GET /sessions`
+- `GET /sessions/{id}`
+- `POST /sessions/{id}/prompt` with `{"prompt":"..."}`
+- `POST /sessions/{id}/cancel`
+
+REST-created Sessions record `rest/api` as their owner. Prompt requests wait
+for the Agent turn to finish and return its stop reason. Failures use JSON error
+bodies with 400 (validation), 401 (authentication), 404 (unknown Session), 409
+(conflicting Session state), or 500 (internal failure), never a successful
+status for failed work.
 
 ## Session durability
 

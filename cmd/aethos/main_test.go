@@ -154,6 +154,9 @@ default_agent = "codex-acp"
 timeout = "25ms"
 auto_approve = ["read", "search"]
 
+[rest]
+bearer_token = "rest-token"
+
 [telegram]
 bot_token = "token"
 chat_id = -1001
@@ -204,8 +207,12 @@ allowed_user_ids = [123]
 func TestRunFirstRunWritesConfigAndRunsTelegramChannelAcrossRestart(t *testing.T) {
 	unsetEnv(t, "AETHOS_DATA_DIR")
 	unsetEnv(t, "AETHOS_TELEGRAM_BOT_TOKEN")
+	unsetEnv(t, "AETHOS_REST_BEARER_TOKEN")
+	unsetEnv(t, "AETHOS_REST_LISTEN_ADDRESS")
 	unsetEnv(t, "AETHOS_WORKSPACE")
 	unsetEnv(t, "AETHOS_DEFAULT_AGENT")
+	t.Setenv("AETHOS_REST_BEARER_TOKEN", "rest-token")
+	t.Setenv("AETHOS_REST_LISTEN_ADDRESS", "127.0.0.1:0")
 
 	var callsMu sync.Mutex
 	var calls []string

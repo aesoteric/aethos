@@ -16,6 +16,7 @@ import (
 
 func TestWizardRepromptsForRejectedTokenAndWritesCommentedConfig(t *testing.T) {
 	unsetEnvironment(t, "AETHOS_TELEGRAM_BOT_TOKEN")
+	unsetEnvironment(t, "AETHOS_REST_BEARER_TOKEN")
 	unsetEnvironment(t, "AETHOS_WORKSPACE")
 	unsetEnvironment(t, "AETHOS_DEFAULT_AGENT")
 
@@ -38,7 +39,7 @@ func TestWizardRepromptsForRejectedTokenAndWritesCommentedConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPaths: %v", err)
 	}
-	input := strings.NewReader("bad-token\ngood-token\n-1001234567890\n123456789, 987654321\n" + workspace + "\ncodex-acp\n")
+	input := strings.NewReader("bad-token\ngood-token\n-1001234567890\n123456789, 987654321\n" + workspace + "\ncodex-acp\nrest-token\n")
 	var output strings.Builder
 
 	validator := telegram.NewClient(server.URL, server.Client())
@@ -59,6 +60,9 @@ func TestWizardRepromptsForRejectedTokenAndWritesCommentedConfig(t *testing.T) {
 	if got.Telegram.BotToken != "good-token" || got.Workspace != workspace || got.DefaultAgent != "codex-acp" {
 		t.Errorf("RunWizard config = %#v, want collected values", got)
 	}
+	if got.REST.BearerToken != "rest-token" || got.REST.ListenAddress != config.DefaultRESTListenAddress {
+		t.Errorf("RunWizard REST config = %#v, want collected token and safe default address", got.REST)
+	}
 	if got.Telegram.ChatID != -1001234567890 {
 		t.Errorf("Telegram.ChatID = %d, want -1001234567890", got.Telegram.ChatID)
 	}
@@ -70,7 +74,7 @@ func TestWizardRepromptsForRejectedTokenAndWritesCommentedConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read generated config: %v", err)
 	}
-	for _, comment := range []string{"# Workspace", "# Agent", "# permissions", "# Telegram", "allowlisted", "AETHOS_TELEGRAM_BOT_TOKEN"} {
+	for _, comment := range []string{"# Workspace", "# Agent", "# permissions", "# REST", "# Telegram", "allowlisted", "AETHOS_TELEGRAM_BOT_TOKEN", "AETHOS_REST_BEARER_TOKEN"} {
 		if !strings.Contains(string(written), comment) {
 			t.Errorf("generated config does not contain explanatory comment %q:\n%s", comment, written)
 		}
@@ -86,6 +90,7 @@ func TestWizardRepromptsForRejectedTokenAndWritesCommentedConfig(t *testing.T) {
 
 func TestWizardDoesNotWriteEnvironmentBotTokenToDisk(t *testing.T) {
 	t.Setenv("AETHOS_TELEGRAM_BOT_TOKEN", "environment-secret")
+	t.Setenv("AETHOS_REST_BEARER_TOKEN", "environment-rest-secret")
 	unsetEnvironment(t, "AETHOS_WORKSPACE")
 	unsetEnvironment(t, "AETHOS_DEFAULT_AGENT")
 
@@ -111,6 +116,9 @@ func TestWizardDoesNotWriteEnvironmentBotTokenToDisk(t *testing.T) {
 	if got.Telegram.BotToken != "environment-secret" {
 		t.Errorf("Telegram.BotToken = %q, want environment value", got.Telegram.BotToken)
 	}
+	if got.REST.BearerToken != "environment-rest-secret" {
+		t.Errorf("REST.BearerToken = %q, want environment value", got.REST.BearerToken)
+	}
 	if strings.Contains(output.String(), "Telegram bot token:") {
 		t.Errorf("wizard prompted for token despite environment secret: %q", output.String())
 	}
@@ -121,6 +129,9 @@ func TestWizardDoesNotWriteEnvironmentBotTokenToDisk(t *testing.T) {
 	}
 	if strings.Contains(string(written), "environment-secret") {
 		t.Fatal("generated config contains the environment-only bot token")
+	}
+	if strings.Contains(string(written), "environment-rest-secret") {
+		t.Fatal("generated config contains the environment-only REST token")
 	}
 }
 
