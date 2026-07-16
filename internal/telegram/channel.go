@@ -73,7 +73,7 @@ type sessionTarget interface {
 	Create(context.Context, session.Create) (session.Record, error)
 	Prompt(context.Context, string, string) (agent.StopReason, error)
 	Cancel(context.Context, string) error
-	ResolvePermission(context.Context, string, string) error
+	ResolvePermission(context.Context, channeltypes.PermissionResponse) error
 	Get(context.Context, string) (session.Record, error)
 	FindByTopic(context.Context, int64) (session.Record, error)
 	Rename(context.Context, string, string) (session.Record, error)

@@ -35,8 +35,18 @@ type PromptFinished struct {
 	Error      string
 }
 
+// SessionState is the Channel-facing representation of a Session's durable
+// lifecycle state.
+type SessionState string
+
+const (
+	SessionLive    SessionState = "live"
+	SessionDormant SessionState = "dormant"
+	SessionClosed  SessionState = "closed"
+)
+
 // SessionStateChanged reports a durable Session lifecycle transition.
-type SessionStateChanged struct{ State string }
+type SessionStateChanged struct{ State SessionState }
 
 func (PromptStarted) isSessionEvent()       {}
 func (PromptFinished) isSessionEvent()      {}
@@ -83,13 +93,9 @@ func NewRouter(owner OwnerLookup, routes map[string]Channel) (*Router, error) {
 
 // Send implements Channel.
 func (r *Router) Send(ctx context.Context, event Event) error {
-	owner, err := r.owner(ctx, event.SessionID)
+	target, err := r.target(ctx, event.SessionID)
 	if err != nil {
 		return err
-	}
-	target := r.routes[owner]
-	if target == nil {
-		return fmt.Errorf("no Channel registered for Session owner %q", owner)
 	}
 	return target.Send(ctx, event)
 }
@@ -97,19 +103,27 @@ func (r *Router) Send(ctx context.Context, event Event) error {
 // SendLifecycle routes a Session-owned event when its Channel supports
 // lifecycle observation.
 func (r *Router) SendLifecycle(ctx context.Context, event LifecycleEvent) error {
-	owner, err := r.owner(ctx, event.SessionID)
+	target, err := r.target(ctx, event.SessionID)
 	if err != nil {
 		return err
-	}
-	target := r.routes[owner]
-	if target == nil {
-		return fmt.Errorf("no Channel registered for Session owner %q", owner)
 	}
 	lifecycle, ok := target.(LifecycleChannel)
 	if !ok {
 		return nil
 	}
 	return lifecycle.SendLifecycle(ctx, event)
+}
+
+func (r *Router) target(ctx context.Context, sessionID string) (Channel, error) {
+	owner, err := r.owner(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	target := r.routes[owner]
+	if target == nil {
+		return nil, fmt.Errorf("no Channel registered for Session owner %q", owner)
+	}
+	return target, nil
 }
 
 // Prompt is inbound text addressed to an existing Session.
@@ -132,7 +146,7 @@ type PermissionResponse struct {
 
 // PermissionTarget accepts answers to pending permission requests.
 type PermissionTarget interface {
-	ResolvePermission(context.Context, string, string) error
+	ResolvePermission(context.Context, PermissionResponse) error
 }
 
 // Memory is an in-memory Channel for flow tests.
@@ -157,7 +171,7 @@ func (m *Memory) Inject(ctx context.Context, target PromptTarget, prompt Prompt)
 // InjectPermission resolves a pending permission request through the human-edge
 // seam.
 func (m *Memory) InjectPermission(ctx context.Context, target PermissionTarget, response PermissionResponse) error {
-	return target.ResolvePermission(ctx, response.RequestID, response.OptionID)
+	return target.ResolvePermission(ctx, response)
 }
 
 // Snapshot returns a copy of every recorded event in delivery order.

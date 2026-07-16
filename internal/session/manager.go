@@ -419,11 +419,11 @@ func (m *Manager) Cancel(ctx context.Context, id string) error {
 
 // ResolvePermission answers one pending Agent permission request. Repeating a
 // completed answer is idempotent.
-func (m *Manager) ResolvePermission(ctx context.Context, requestID, optionID string) error {
+func (m *Manager) ResolvePermission(ctx context.Context, response channel.PermissionResponse) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return m.permissions.Resolve(requestID, optionID)
+	return m.permissions.Resolve(response.RequestID, response.OptionID)
 }
 
 func (m *Manager) permissionHandler(id string) agent.PermissionHandler {
@@ -534,7 +534,7 @@ func (m *Manager) sendLifecycle(ctx context.Context, event channel.LifecycleEven
 func (m *Manager) surfaceState(id string, state State) {
 	if err := m.sendLifecycle(m.ctx, channel.LifecycleEvent{
 		SessionID:    id,
-		SessionEvent: channel.SessionStateChanged{State: string(state)},
+		SessionEvent: channel.SessionStateChanged{State: channel.SessionState(state)},
 	}); err != nil && m.ctx.Err() == nil {
 		m.recordBackgroundError(fmt.Errorf("surface %s state for Session %q: %w", state, id, err))
 	}
@@ -798,7 +798,7 @@ func (m *Manager) CloseSession(ctx context.Context, id string) (Record, error) {
 	}
 	if err := m.sendLifecycle(m.ctx, channel.LifecycleEvent{
 		SessionID:    id,
-		SessionEvent: channel.SessionStateChanged{State: string(Closed)},
+		SessionEvent: channel.SessionStateChanged{State: channel.SessionClosed},
 	}); err != nil && m.ctx.Err() == nil {
 		closeErr = errors.Join(closeErr, fmt.Errorf("surface closed state for Session %q: %w", id, err))
 	}

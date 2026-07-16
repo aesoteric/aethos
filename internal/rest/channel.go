@@ -40,7 +40,7 @@ type sessionTarget interface {
 	Get(context.Context, string) (session.Record, error)
 	List(context.Context) ([]session.Record, error)
 	Prompt(context.Context, string, string) (agent.StopReason, error)
-	ResolvePermission(context.Context, string, string) error
+	ResolvePermission(context.Context, channel.PermissionResponse) error
 }
 
 // Channel translates authenticated HTTP requests into Session operations.
@@ -54,11 +54,11 @@ type Channel struct {
 }
 
 type eventSubscriber struct {
-	events chan serverEvent
+	events chan sseEvent
 	done   <-chan struct{}
 }
 
-type serverEvent struct {
+type sseEvent struct {
 	name     string
 	data     []byte
 	terminal bool
@@ -176,7 +176,10 @@ func (c *Channel) answerPermission(w http.ResponseWriter, r *http.Request, sessi
 		writeError(w, http.StatusBadRequest, "option_id is required")
 		return
 	}
-	if err := sessions.ResolvePermission(r.Context(), requestID, input.OptionID); err != nil {
+	if err := sessions.ResolvePermission(r.Context(), channel.PermissionResponse{
+		RequestID: requestID,
+		OptionID:  input.OptionID,
+	}); err != nil {
 		switch {
 		case errors.Is(err, permission.ErrUnknownRequest):
 			writeError(w, http.StatusNotFound, "permission request not found")
@@ -253,7 +256,7 @@ func (c *Channel) subscribe(sessionID string, done <-chan struct{}) (uint64, *ev
 	defer c.streamMu.Unlock()
 	c.nextSubscriber++
 	id := c.nextSubscriber
-	subscriber := &eventSubscriber{events: make(chan serverEvent, 32), done: done}
+	subscriber := &eventSubscriber{events: make(chan sseEvent, 32), done: done}
 	if c.streams[sessionID] == nil {
 		c.streams[sessionID] = make(map[uint64]*eventSubscriber)
 	}
@@ -271,7 +274,7 @@ func (c *Channel) unsubscribe(sessionID string, subscriberID uint64) {
 	}
 }
 
-func (c *Channel) publish(ctx context.Context, sessionID string, event serverEvent) error {
+func (c *Channel) publish(ctx context.Context, sessionID string, event sseEvent) error {
 	c.streamMu.Lock()
 	defer c.streamMu.Unlock()
 	for id, subscriber := range c.streams[sessionID] {
@@ -503,7 +506,7 @@ func (c *Channel) Send(ctx context.Context, event channel.Event) error {
 	return c.publish(ctx, event.SessionID, outbound)
 }
 
-// SendLifecycle implements channel.LifecycleChannel for the machine head.
+// SendLifecycle implements channel.LifecycleChannel for the REST Channel.
 func (c *Channel) SendLifecycle(ctx context.Context, event channel.LifecycleEvent) error {
 	outbound, err := lifecycleServerEvent(event.SessionEvent)
 	if err != nil {
@@ -512,7 +515,7 @@ func (c *Channel) SendLifecycle(ctx context.Context, event channel.LifecycleEven
 	return c.publish(ctx, event.SessionID, outbound)
 }
 
-func lifecycleServerEvent(event channel.SessionEvent) (serverEvent, error) {
+func lifecycleServerEvent(event channel.SessionEvent) (sseEvent, error) {
 	var name string
 	var payload any
 	terminal := false
@@ -530,18 +533,18 @@ func lifecycleServerEvent(event channel.SessionEvent) (serverEvent, error) {
 		}{StopReason: one.StopReason, Error: one.Error}
 	case channel.SessionStateChanged:
 		name = "session_state_changed"
-		terminal = one.State == string(session.Closed)
+		terminal = one.State == channel.SessionClosed
 		payload = struct {
-			State string `json:"state"`
+			State channel.SessionState `json:"state"`
 		}{State: one.State}
 	default:
-		return serverEvent{}, fmt.Errorf("unsupported lifecycle event %T", event)
+		return sseEvent{}, fmt.Errorf("unsupported lifecycle event %T", event)
 	}
 	data, err := json.Marshal(payload)
-	return serverEvent{name: name, data: data, terminal: terminal}, err
+	return sseEvent{name: name, data: data, terminal: terminal}, err
 }
 
-func agentServerEvent(event agent.Event) (serverEvent, bool, error) {
+func agentServerEvent(event agent.Event) (sseEvent, bool, error) {
 	var name string
 	var payload any
 	switch one := event.(type) {
@@ -606,8 +609,8 @@ func agentServerEvent(event agent.Event) (serverEvent, bool, error) {
 			Error string `json:"error"`
 		}{Error: one.Error}
 	default:
-		return serverEvent{}, false, nil
+		return sseEvent{}, false, nil
 	}
 	data, err := json.Marshal(payload)
-	return serverEvent{name: name, data: data}, true, err
+	return sseEvent{name: name, data: data}, true, err
 }

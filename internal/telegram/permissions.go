@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/aesoteric/aethos/internal/agent"
+	"github.com/aesoteric/aethos/internal/channel"
 )
 
 const (
@@ -68,7 +69,10 @@ func (c *Channel) handleCallback(ctx context.Context, query *callbackQuery) (ret
 		answer = "aethos is not ready."
 		return nil
 	}
-	if err := sessions.ResolvePermission(ctx, requestID, optionID); err != nil {
+	if err := sessions.ResolvePermission(ctx, channel.PermissionResponse{
+		RequestID: requestID,
+		OptionID:  optionID,
+	}); err != nil {
 		answer = "The permission response could not be recorded."
 		return err
 	}
