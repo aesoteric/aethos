@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/aesoteric/aethos/internal/agent"
+	"github.com/aesoteric/aethos/internal/sessionstate"
 )
 
 // Event is an observable Agent event addressed to an aethos Session.
@@ -35,18 +36,8 @@ type PromptFinished struct {
 	Error      string
 }
 
-// SessionState is the Channel-facing representation of a Session's durable
-// lifecycle state.
-type SessionState string
-
-const (
-	SessionLive    SessionState = "live"
-	SessionDormant SessionState = "dormant"
-	SessionClosed  SessionState = "closed"
-)
-
 // SessionStateChanged reports a durable Session lifecycle transition.
-type SessionStateChanged struct{ State SessionState }
+type SessionStateChanged struct{ State sessionstate.State }
 
 func (PromptStarted) isSessionEvent()       {}
 func (PromptFinished) isSessionEvent()      {}

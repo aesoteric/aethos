@@ -22,6 +22,7 @@ import (
 	"github.com/aesoteric/aethos/internal/channel"
 	"github.com/aesoteric/aethos/internal/permission"
 	"github.com/aesoteric/aethos/internal/session"
+	"github.com/aesoteric/aethos/internal/sessionstate"
 )
 
 const maxRequestBody = 1 << 20
@@ -533,9 +534,9 @@ func lifecycleServerEvent(event channel.SessionEvent) (sseEvent, error) {
 		}{StopReason: one.StopReason, Error: one.Error}
 	case channel.SessionStateChanged:
 		name = "session_state_changed"
-		terminal = one.State == channel.SessionClosed
+		terminal = one.State == sessionstate.Closed
 		payload = struct {
-			State channel.SessionState `json:"state"`
+			State sessionstate.State `json:"state"`
 		}{State: one.State}
 	default:
 		return sseEvent{}, fmt.Errorf("unsupported lifecycle event %T", event)

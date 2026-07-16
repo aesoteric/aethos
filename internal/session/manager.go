@@ -17,34 +17,17 @@ import (
 	"github.com/aesoteric/aethos/internal/agent"
 	"github.com/aesoteric/aethos/internal/channel"
 	"github.com/aesoteric/aethos/internal/permission"
+	"github.com/aesoteric/aethos/internal/sessionstate"
 )
 
 // State is the persisted lifecycle state of a Session.
-type State string
+type State = sessionstate.State
 
 const (
-	// Live means an Agent connection is attached to the Session.
-	Live State = "live"
-	// Dormant means the record is durable but no Agent connection is attached.
-	Dormant State = "dormant"
-	// Closed means the Session was deliberately archived and cannot resume.
-	Closed State = "closed"
+	Live    = sessionstate.Live
+	Dormant = sessionstate.Dormant
+	Closed  = sessionstate.Closed
 )
-
-// CanTransitionTo reports whether next is a valid lifecycle transition from
-// state. Creation enters Live directly; Closed is terminal.
-func (state State) CanTransitionTo(next State) bool {
-	switch state {
-	case Live:
-		return next == Dormant || next == Closed
-	case Dormant:
-		return next == Live || next == Closed
-	case Closed:
-		return false
-	default:
-		return false
-	}
-}
 
 // Owner identifies the person or machine that created a Session. Channel
 // disambiguates identities from different user-facing Channels.
@@ -534,7 +517,7 @@ func (m *Manager) sendLifecycle(ctx context.Context, event channel.LifecycleEven
 func (m *Manager) surfaceState(id string, state State) {
 	if err := m.sendLifecycle(m.ctx, channel.LifecycleEvent{
 		SessionID:    id,
-		SessionEvent: channel.SessionStateChanged{State: channel.SessionState(state)},
+		SessionEvent: channel.SessionStateChanged{State: state},
 	}); err != nil && m.ctx.Err() == nil {
 		m.recordBackgroundError(fmt.Errorf("surface %s state for Session %q: %w", state, id, err))
 	}
@@ -798,7 +781,7 @@ func (m *Manager) CloseSession(ctx context.Context, id string) (Record, error) {
 	}
 	if err := m.sendLifecycle(m.ctx, channel.LifecycleEvent{
 		SessionID:    id,
-		SessionEvent: channel.SessionStateChanged{State: channel.SessionClosed},
+		SessionEvent: channel.SessionStateChanged{State: Closed},
 	}); err != nil && m.ctx.Err() == nil {
 		closeErr = errors.Join(closeErr, fmt.Errorf("surface closed state for Session %q: %w", id, err))
 	}
