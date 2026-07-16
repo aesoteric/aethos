@@ -430,7 +430,7 @@ func (m *Manager) permissionHandler(id string) agent.PermissionHandler {
 		if err != nil {
 			return agent.PermissionDecision{}, err
 		}
-		if result.Presented {
+		if result.NotifyOutcome {
 			if sendErr := m.channel.Send(m.ctx, channel.Event{
 				SessionID: id,
 				AgentEvent: agent.PermissionResolved{

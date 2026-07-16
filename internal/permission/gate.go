@@ -11,7 +11,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/aesoteric/aethos/internal/agent"
@@ -47,13 +46,13 @@ type Gate struct {
 	issued   uint64
 }
 
-// Result contains the Agent-facing decision and the presentation state a
-// Channel needs to finish a surfaced permission request.
+// Result contains the Agent-facing decision and whether Channels should apply
+// a terminal update to any permission request they successfully presented.
 type Result struct {
-	RequestID string
-	Decision  agent.PermissionDecision
-	Presented bool
-	TimedOut  bool
+	RequestID     string
+	Decision      agent.PermissionDecision
+	NotifyOutcome bool
+	TimedOut      bool
 }
 
 type pendingRequest struct {
@@ -111,13 +110,8 @@ func (g *Gate) Request(ctx context.Context, sessionID string, request agent.Perm
 	presentCtx, cancelPresent := context.WithCancel(ctx)
 	defer cancelPresent()
 	presented := make(chan error, 1)
-	var presentationSucceeded atomic.Bool
 	go func() {
-		err := g.present(presentCtx, sessionID, requested)
-		if err == nil {
-			presentationSucceeded.Store(true)
-		}
-		presented <- err
+		presented <- g.present(presentCtx, sessionID, requested)
 	}()
 
 	for {
@@ -133,15 +127,15 @@ func (g *Gate) Request(ctx context.Context, sessionID string, request agent.Perm
 			presented = nil
 		case <-timer.C:
 			g.finish(id, Result{
-				Decision:  failSafeDecision(request.Options),
-				Presented: presentationSucceeded.Load(),
-				TimedOut:  true,
+				Decision:      failSafeDecision(request.Options),
+				NotifyOutcome: true,
+				TimedOut:      true,
 			})
 			return <-pending.done, nil
 		case <-ctx.Done():
 			g.finish(id, Result{
-				Decision:  agent.PermissionDecision{Cancelled: true},
-				Presented: presentationSucceeded.Load(),
+				Decision:      agent.PermissionDecision{Cancelled: true},
+				NotifyOutcome: true,
 			})
 			return <-pending.done, nil
 		}
@@ -166,8 +160,8 @@ func (g *Gate) Resolve(requestID, optionID string) error {
 		return fmt.Errorf("resolve permission %q with option %q: %w", requestID, optionID, ErrUnknownOption)
 	}
 	g.finishLocked(requestID, pending, Result{
-		Decision:  agent.PermissionDecision{OptionID: optionID},
-		Presented: true,
+		Decision:      agent.PermissionDecision{OptionID: optionID},
+		NotifyOutcome: true,
 	})
 	return nil
 }

@@ -1193,6 +1193,9 @@ func (c *blockingPermissionChannel) Send(ctx context.Context, event channel.Even
 		<-ctx.Done()
 		return ctx.Err()
 	}
+	if _, resolution := event.AgentEvent.(agent.PermissionResolved); resolution {
+		return nil
+	}
 	return c.memory.Send(ctx, event)
 }
 
