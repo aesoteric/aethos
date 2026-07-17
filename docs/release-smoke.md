@@ -6,24 +6,24 @@ commit, hosts, and Agent below so another operator can reproduce the result.
 
 ## Execution record
 
-- Release tag:
-- Commit from `aethos version`:
-- Date and tester:
-- Binary host and architecture:
-- Docker host and architecture:
-- systemd host and distribution:
-- ACP Agent ID and version:
-- Telegram bot and forum group (non-secret identifiers only):
+- Release tag: `v0.1.0`
+- Commit from `aethos version`: `a4b6c34`
+- Date and tester: 2026-07-17, Codex automated publication smoke
+- Binary host and architecture: macOS 26.5.2, arm64
+- Docker host and architecture: Docker Desktop, Linux arm64
+- systemd host and distribution: pending real-host smoke
+- ACP Agent ID and version: `opencode` 1.18.3 (installation and execution verified)
+- Telegram bot and forum group (non-secret identifiers only): pending real-session smoke
 
 ## Published artifacts
 
-- [ ] The GitHub Release contains Linux and macOS archives for amd64 and arm64,
+- [x] The GitHub Release contains Linux and macOS archives for amd64 and arm64,
       plus `checksums.txt`.
-- [ ] `sha256sum -c checksums.txt` (or `shasum -a 256 -c checksums.txt`) passes
+- [x] `sha256sum -c checksums.txt` (or `shasum -a 256 -c checksums.txt`) passes
       for every downloaded archive.
-- [ ] The archive for the binary host contains `aethos`, `README.md`, and
+- [x] The archive for the binary host contains `aethos`, `README.md`, and
       `LICENSE`; `aethos version` reports the release version and tagged commit.
-- [ ] `ghcr.io/aesoteric/aethos:<version>` resolves to amd64 and arm64 images,
+- [x] `ghcr.io/aesoteric/aethos:<version>` resolves to amd64 and arm64 images,
       and the stable release is also available as `latest`.
 
 ## Real Telegram and Agent
@@ -64,6 +64,10 @@ commit, hosts, and Agent below so another operator can reproduce the result.
 
 ## Release result
 
-- [ ] Paste links to the GitHub Actions release run and GitHub Release here.
-- [ ] Record any deviations or follow-up issues here.
+- [x] GitHub Actions [release run](https://github.com/aesoteric/aethos/actions/runs/29585298144)
+      and [GitHub Release](https://github.com/aesoteric/aethos/releases/tag/v0.1.0).
+- [x] Automated artifact checks passed. The published image installed and ran
+      `opencode` 1.18.3 from a clean, single bind mount and retained it across
+      container recreation. The real Telegram Session, full one-volume wizard
+      and Session recreation, and real systemd-host checks remain pending.
 - [ ] Mark the release accepted only after every box above is checked.
