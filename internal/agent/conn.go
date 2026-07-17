@@ -90,19 +90,6 @@ func Spawn(
 	return SpawnLaunch(ctx, logger, handlers, Launch{Command: name, Args: args})
 }
 
-// SpawnWithEnvironment launches an ACP Agent with catalog-provided
-// environment overrides in addition to the parent process environment.
-func SpawnWithEnvironment(
-	ctx context.Context,
-	logger *slog.Logger,
-	handlers Handlers,
-	environment map[string]string,
-	name string,
-	args ...string,
-) (*Conn, error) {
-	return SpawnLaunch(ctx, logger, handlers, Launch{Command: name, Args: args, Env: environment})
-}
-
 // SpawnLaunch launches an ACP Agent from one typed launch definition.
 func SpawnLaunch(
 	ctx context.Context,
