@@ -20,6 +20,13 @@ type TokenValidator interface {
 	ValidateToken(context.Context, string) error
 }
 
+// AgentChoice is one installed Agent offered by the setup wizard.
+type AgentChoice struct {
+	ID   string
+	Name string
+	Type string
+}
+
 // RunWizard collects a first-run configuration, validates it, and writes it to
 // paths.ConfigFile. Secrets supplied through the environment are never copied
 // into the file.
@@ -29,6 +36,7 @@ func RunWizard(
 	output io.Writer,
 	paths Paths,
 	validator TokenValidator,
+	agents []AgentChoice,
 ) (Config, error) {
 	if validator == nil {
 		return Config{}, fmt.Errorf("Telegram token validator is required")
@@ -53,7 +61,7 @@ func RunWizard(
 	if err != nil {
 		return Config{}, err
 	}
-	defaultAgent, err := interaction.collectValue(defaultAgentEnv, "Default Agent command: ")
+	defaultAgent, err := interaction.collectAgent(agents)
 	if err != nil {
 		return Config{}, err
 	}
@@ -90,6 +98,41 @@ func RunWizard(
 		return Config{}, fmt.Errorf("verify generated config: %w", err)
 	}
 	return loaded, nil
+}
+
+func (i wizardInteraction) collectAgent(agents []AgentChoice) (string, error) {
+	if len(agents) == 0 {
+		return i.collectValue(defaultAgentEnv, "Default Agent command: ")
+	}
+	fmt.Fprintln(i.output, "Installed Agents:")
+	for _, agent := range agents {
+		fmt.Fprintf(i.output, "  %s — %s (%s)\n", agent.ID, agent.Name, agent.Type)
+	}
+	if value, ok := nonEmptyEnvironment(defaultAgentEnv); ok {
+		if isAgentChoice(value, agents) {
+			return value, nil
+		}
+		return "", fmt.Errorf("invalid %s: Agent %q is not installed", defaultAgentEnv, value)
+	}
+	for {
+		value, err := i.prompt("Default Agent ID: ")
+		if err != nil {
+			return "", err
+		}
+		if isAgentChoice(value, agents) {
+			return value, nil
+		}
+		fmt.Fprintln(i.output, "Choose one of the installed Agent IDs shown above.")
+	}
+}
+
+func isAgentChoice(id string, agents []AgentChoice) bool {
+	for _, agent := range agents {
+		if id == agent.ID {
+			return true
+		}
+	}
+	return false
 }
 
 type wizardInteraction struct {
@@ -267,7 +310,7 @@ func writeCommentedConfig(paths Paths, cfg Config) error {
 	contents.WriteString(`# aethos configuration
 #
 # Workspace is the directory offered when a Session is created.
-# Agent is the command used to start the default ACP-compatible Agent.
+# Agent is the installed catalog ID used for new Sessions by default.
 # idle_timeout releases an Agent subprocess while keeping its Session record;
 # the next Prompt resumes it automatically.
 # permissions.timeout denies unanswered risky actions after the deadline.

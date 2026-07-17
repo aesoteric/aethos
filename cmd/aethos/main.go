@@ -15,9 +15,11 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"text/tabwriter"
 	"time"
 
 	"github.com/aesoteric/aethos/internal/agent"
+	"github.com/aesoteric/aethos/internal/agentcatalog"
 	channeltypes "github.com/aesoteric/aethos/internal/channel"
 	"github.com/aesoteric/aethos/internal/config"
 	"github.com/aesoteric/aethos/internal/rest"
@@ -29,10 +31,12 @@ import (
 const usage = `aethos — self-hosted bridge from ACP coding agents to messaging platforms
 
 usage: aethos [-data-dir <directory>]
+       aethos agents [-data-dir <directory>]
+       aethos agents install [-data-dir <directory>] <agent-id>
 
-On first run, aethos creates a commented config.toml with an interactive
-setup wizard. The data directory defaults to ~/.aethos and can also be set
-with AETHOS_DATA_DIR.
+Install an Agent before first run; aethos then creates a commented config.toml
+with an interactive setup wizard. The data directory defaults to ~/.aethos and
+can also be set with AETHOS_DATA_DIR.
 `
 
 // errUsage signals that usage help was printed and no further error
@@ -79,8 +83,27 @@ func run(
 	stdout, stderr io.Writer,
 	telegramClient *telegram.Client,
 ) error {
+	registryClient := &http.Client{Timeout: 30 * time.Second}
+	return runWithRegistry(
+		ctx, logger, args, stdin, stdout, stderr, telegramClient,
+		agentcatalog.NewRegistry("", registryClient),
+	)
+}
+
+func runWithRegistry(
+	ctx context.Context,
+	logger *slog.Logger,
+	args []string,
+	stdin io.Reader,
+	stdout, stderr io.Writer,
+	telegramClient *telegram.Client,
+	registry *agentcatalog.Registry,
+) error {
 	if len(args) >= 2 && args[0] == "dev" && args[1] == "prompt" {
 		return devPrompt(ctx, logger, args[2:], stdout, stderr)
+	}
+	if len(args) >= 1 && args[0] == "agents" {
+		return agentsCommand(ctx, args[1:], stdout, stderr, registry)
 	}
 
 	fs := flag.NewFlagSet("aethos", flag.ContinueOnError)
@@ -103,6 +126,10 @@ func run(
 	if err != nil {
 		return err
 	}
+	catalog, err := agentcatalog.Open(paths.AgentCatalogFile, paths.AgentsDir)
+	if err != nil {
+		return err
+	}
 
 	var configured config.Config
 	_, err = os.Stat(paths.ConfigFile)
@@ -116,12 +143,31 @@ func run(
 		if telegramClient == nil {
 			return fmt.Errorf("start first-run setup: Telegram token validator is unavailable")
 		}
-		configured, err = config.RunWizard(ctx, stdin, stdout, paths, telegramClient)
+		installed, installedErr := catalog.Installed()
+		if installedErr != nil {
+			return installedErr
+		}
+		if len(installed) == 0 {
+			return fmt.Errorf("start first-run setup: no Agents are installed; run aethos agents install <agent-id> first")
+		}
+		choices := make([]config.AgentChoice, 0, len(installed))
+		for _, installedAgent := range installed {
+			choices = append(choices, config.AgentChoice{
+				ID: installedAgent.ID, Name: installedAgent.Name, Type: string(installedAgent.Type),
+			})
+		}
+		configured, err = config.RunWizard(ctx, stdin, stdout, paths, telegramClient, choices)
 		if err != nil {
 			return err
 		}
 	default:
 		return fmt.Errorf("inspect config %q: %w", paths.ConfigFile, err)
+	}
+	if _, err := catalog.Resolve(configured.DefaultAgent); err != nil {
+		return fmt.Errorf(
+			"default Agent %q is not installed; run aethos agents install %s: %w",
+			configured.DefaultAgent, configured.DefaultAgent, err,
+		)
 	}
 	if telegramClient == nil {
 		return fmt.Errorf("start Telegram Channel: client is unavailable")
@@ -171,7 +217,7 @@ func run(
 	manager, err = session.Open(
 		ctx,
 		paths.DatabaseFile,
-		agentConnector(logger),
+		agentConnector(logger, catalog),
 		events,
 		session.WithIdleTimeout(time.Duration(configured.IdleTimeout)),
 		session.WithPermissionTimeout(time.Duration(configured.Permissions.Timeout)),
@@ -182,6 +228,106 @@ func run(
 	}
 	runErr := runChannels(ctx, bridge, api, manager)
 	return errors.Join(runErr, manager.Close(), bridge.Close())
+}
+
+func agentsCommand(
+	ctx context.Context,
+	args []string,
+	stdout, stderr io.Writer,
+	registry *agentcatalog.Registry,
+) error {
+	if registry == nil {
+		return fmt.Errorf("ACP Agent registry client is unavailable")
+	}
+	if len(args) > 0 && args[0] == "install" {
+		return installAgentCommand(ctx, args[1:], stdout, stderr, registry)
+	}
+	fs := flag.NewFlagSet("agents", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	dataDirFlag := fs.String("data-dir", "", "directory containing the local Agent catalog")
+	if err := fs.Parse(args); err != nil {
+		return errUsage
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "usage: aethos agents [-data-dir <directory>]")
+		return errUsage
+	}
+	if _, err := config.ResolveDataDir(*dataDirFlag); err != nil {
+		return err
+	}
+	agents, err := registry.List(ctx)
+	if err != nil {
+		return err
+	}
+	table := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
+	if _, err := fmt.Fprintln(table, "ID\tNAME\tTYPE\tDESCRIPTION"); err != nil {
+		return fmt.Errorf("write Agent list: %w", err)
+	}
+	for _, registryAgent := range agents {
+		if _, err := fmt.Fprintf(
+			table, "%s\t%s\t%s\t%s\n",
+			registryAgent.ID, registryAgent.Name, registryAgent.Type(), registryAgent.Description,
+		); err != nil {
+			return fmt.Errorf("write Agent list: %w", err)
+		}
+	}
+	if err := table.Flush(); err != nil {
+		return fmt.Errorf("write Agent list: %w", err)
+	}
+	return nil
+}
+
+func installAgentCommand(
+	ctx context.Context,
+	args []string,
+	stdout, stderr io.Writer,
+	registry *agentcatalog.Registry,
+) error {
+	fs := flag.NewFlagSet("agents install", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	dataDirFlag := fs.String("data-dir", "", "directory containing the local Agent catalog")
+	if err := fs.Parse(args); err != nil {
+		return errUsage
+	}
+	if fs.NArg() != 1 {
+		fmt.Fprintln(stderr, "usage: aethos agents install [-data-dir <directory>] <agent-id>")
+		return errUsage
+	}
+	agentID := fs.Arg(0)
+	agents, err := registry.List(ctx)
+	if err != nil {
+		return err
+	}
+	var selected *agentcatalog.RegistryAgent
+	for index := range agents {
+		if agents[index].ID == agentID {
+			selected = &agents[index]
+			break
+		}
+	}
+	if selected == nil {
+		return fmt.Errorf("Agent %q was not found in the ACP registry", agentID)
+	}
+	dataDir, err := config.ResolveDataDir(*dataDirFlag)
+	if err != nil {
+		return err
+	}
+	paths, err := config.NewPaths(dataDir)
+	if err != nil {
+		return err
+	}
+	catalog, err := agentcatalog.Open(paths.AgentCatalogFile, paths.AgentsDir)
+	if err != nil {
+		return err
+	}
+	installed, err := catalog.Install(ctx, *selected, nil)
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(stdout, "Installed %s (%s) via %s.\n", installed.Name, installed.ID, installed.Type); err != nil {
+		return fmt.Errorf("write Agent installation result: %w", err)
+	}
+	return nil
 }
 
 func runChannels(ctx context.Context, telegramChannel *telegram.Channel, restChannel *rest.Channel, manager *session.Manager) error {
@@ -200,7 +346,7 @@ func runChannels(ctx context.Context, telegramChannel *telegram.Channel, restCha
 // installed ACP agent, open a Session, dispatch one Prompt, and stream
 // the agent's output to stdout as it happens.
 func devPrompt(ctx context.Context, logger *slog.Logger, args []string, stdout, stderr io.Writer) error {
-	_, err := devPromptWithConnector(ctx, logger, args, stdout, stderr, agentConnector(logger))
+	_, err := devPromptWithConnector(ctx, logger, args, stdout, stderr, directAgentConnector(logger))
 	return err
 }
 
@@ -298,7 +444,39 @@ func devPromptWithConnector(
 	return record.ID, nil
 }
 
-func agentConnector(logger *slog.Logger) session.Connect {
+type agentSpawner func(
+	context.Context,
+	*slog.Logger,
+	agent.Handlers,
+	string,
+	[]string,
+	map[string]string,
+) (*agent.Conn, error)
+
+func agentConnector(logger *slog.Logger, catalog *agentcatalog.Catalog) session.Connect {
+	return agentConnectorWithSpawner(
+		logger,
+		catalog,
+		func(ctx context.Context, logger *slog.Logger, handlers agent.Handlers, command string, args []string, env map[string]string) (*agent.Conn, error) {
+			return agent.SpawnWithEnvironment(ctx, logger, handlers, env, command, args...)
+		},
+	)
+}
+
+func agentConnectorWithSpawner(logger *slog.Logger, catalog *agentcatalog.Catalog, spawn agentSpawner) session.Connect {
+	return func(ctx context.Context, id string, handlers agent.Handlers) (*agent.Conn, error) {
+		if catalog == nil {
+			return nil, fmt.Errorf("Agent catalog is unavailable")
+		}
+		installed, err := catalog.Resolve(id)
+		if err != nil {
+			return nil, err
+		}
+		return spawn(ctx, logger, handlers, installed.Command, installed.Args, installed.Env)
+	}
+}
+
+func directAgentConnector(logger *slog.Logger) session.Connect {
 	return func(ctx context.Context, command string, handlers agent.Handlers) (*agent.Conn, error) {
 		args := strings.Fields(command)
 		if len(args) == 0 {

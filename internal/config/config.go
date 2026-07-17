@@ -52,10 +52,12 @@ const (
 
 // Paths names every persistent location rooted in aethos's data directory.
 type Paths struct {
-	DataDir      string
-	ConfigFile   string
-	DatabaseFile string
-	LogsDir      string
+	DataDir          string
+	ConfigFile       string
+	DatabaseFile     string
+	AgentCatalogFile string
+	AgentsDir        string
+	LogsDir          string
 }
 
 // Telegram holds configuration for the Telegram Channel.
@@ -132,10 +134,12 @@ func NewPaths(dataDir string) (Paths, error) {
 		return Paths{}, err
 	}
 	return Paths{
-		DataDir:      abs,
-		ConfigFile:   filepath.Join(abs, "config.toml"),
-		DatabaseFile: filepath.Join(abs, "aethos.db"),
-		LogsDir:      filepath.Join(abs, "logs"),
+		DataDir:          abs,
+		ConfigFile:       filepath.Join(abs, "config.toml"),
+		DatabaseFile:     filepath.Join(abs, "aethos.db"),
+		AgentCatalogFile: filepath.Join(abs, "agents.json"),
+		AgentsDir:        filepath.Join(abs, "agents"),
+		LogsDir:          filepath.Join(abs, "logs"),
 	}, nil
 }
 

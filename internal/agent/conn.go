@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"sync"
 
@@ -64,9 +66,43 @@ func Spawn(
 	name string,
 	args ...string,
 ) (*Conn, error) {
+	return SpawnWithEnvironment(ctx, logger, handlers, nil, name, args...)
+}
+
+// SpawnWithEnvironment launches an ACP Agent with catalog-provided
+// environment overrides in addition to the parent process environment.
+func SpawnWithEnvironment(
+	ctx context.Context,
+	logger *slog.Logger,
+	handlers Handlers,
+	environment map[string]string,
+	name string,
+	args ...string,
+) (*Conn, error) {
 	// Conn owns the subprocess lifetime. The caller's context bounds startup and
 	// protocol operations; Close is the single place that terminates the Agent.
 	cmd := exec.Command(name, args...)
+	if len(environment) > 0 {
+		keys := make([]string, 0, len(environment))
+		for key := range environment {
+			if key == "" || strings.ContainsRune(key, '=') {
+				return nil, fmt.Errorf("invalid Agent environment variable name %q", key)
+			}
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		base := os.Environ()
+		cmd.Env = make([]string, 0, len(base)+len(keys))
+		for _, assignment := range base {
+			key, _, _ := strings.Cut(assignment, "=")
+			if _, overridden := environment[key]; !overridden {
+				cmd.Env = append(cmd.Env, assignment)
+			}
+		}
+		for _, key := range keys {
+			cmd.Env = append(cmd.Env, key+"="+environment[key])
+		}
+	}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, fmt.Errorf("agent stdin: %w", err)

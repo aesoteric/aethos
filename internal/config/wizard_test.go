@@ -43,7 +43,10 @@ func TestWizardRepromptsForRejectedTokenAndWritesCommentedConfig(t *testing.T) {
 	var output strings.Builder
 
 	validator := telegram.NewClient(server.URL, server.Client())
-	got, err := config.RunWizard(t.Context(), input, &output, paths, validator)
+	got, err := config.RunWizard(t.Context(), input, &output, paths, validator, []config.AgentChoice{
+		{ID: "codex-acp", Name: "Codex", Type: "npx"},
+		{ID: "goose", Name: "goose", Type: "binary"},
+	})
 	if err != nil {
 		t.Fatalf("RunWizard: %v", err)
 	}
@@ -56,6 +59,11 @@ func TestWizardRepromptsForRejectedTokenAndWritesCommentedConfig(t *testing.T) {
 	}
 	if !strings.Contains(output.String(), "Unauthorized") {
 		t.Errorf("wizard output = %q, want clear Telegram rejection", output.String())
+	}
+	for _, want := range []string{"Installed Agents:", "codex-acp", "Codex", "npx", "goose", "binary"} {
+		if !strings.Contains(output.String(), want) {
+			t.Errorf("wizard output = %q, want installed Agent choice %q", output.String(), want)
+		}
 	}
 	if got.Telegram.BotToken != "good-token" || got.Workspace != workspace || got.DefaultAgent != "codex-acp" {
 		t.Errorf("RunWizard config = %#v, want collected values", got)
@@ -109,7 +117,7 @@ func TestWizardDoesNotWriteEnvironmentBotTokenToDisk(t *testing.T) {
 	var output strings.Builder
 
 	validator := telegram.NewClient(server.URL, server.Client())
-	got, err := config.RunWizard(t.Context(), input, &output, paths, validator)
+	got, err := config.RunWizard(t.Context(), input, &output, paths, validator, nil)
 	if err != nil {
 		t.Fatalf("RunWizard: %v", err)
 	}

@@ -18,8 +18,120 @@ import (
 	"time"
 
 	"github.com/aesoteric/aethos/internal/agent"
+	"github.com/aesoteric/aethos/internal/agentcatalog"
+	"github.com/aesoteric/aethos/internal/channel"
+	"github.com/aesoteric/aethos/internal/session"
 	"github.com/aesoteric/aethos/internal/telegram"
 )
+
+func TestAgentsCommandListsAndInstallsRegistryAgent(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{
+  "version": "1.0.0",
+  "agents": [{
+    "id": "codex-acp",
+    "name": "Codex",
+    "version": "1.1.4",
+    "description": "ACP integration for Codex",
+    "distribution": {"npx": {"package": "@agentclientprotocol/codex-acp@1.1.4"}}
+  }]
+}`)
+	}))
+	t.Cleanup(server.Close)
+	registry := agentcatalog.NewRegistry(server.URL, server.Client())
+	dataDir := t.TempDir()
+	logger := slog.New(slog.DiscardHandler)
+
+	var listOutput strings.Builder
+	if err := runWithRegistry(
+		t.Context(), logger, []string{"agents", "-data-dir", dataDir},
+		strings.NewReader(""), &listOutput, io.Discard, nil, registry,
+	); err != nil {
+		t.Fatalf("list registry Agents: %v", err)
+	}
+	for _, want := range []string{"codex-acp", "Codex", "npx", "ACP integration for Codex"} {
+		if !strings.Contains(listOutput.String(), want) {
+			t.Errorf("agents output = %q, want %q", listOutput.String(), want)
+		}
+	}
+
+	var installOutput strings.Builder
+	if err := runWithRegistry(
+		t.Context(), logger, []string{"agents", "install", "-data-dir", dataDir, "codex-acp"},
+		strings.NewReader(""), &installOutput, io.Discard, nil, registry,
+	); err != nil {
+		t.Fatalf("install registry Agent: %v", err)
+	}
+	if !strings.Contains(installOutput.String(), "Installed Codex (codex-acp)") {
+		t.Errorf("install output = %q, want installed Agent confirmation", installOutput.String())
+	}
+	reopened, err := agentcatalog.Open(filepath.Join(dataDir, "agents.json"), filepath.Join(dataDir, "agents"))
+	if err != nil {
+		t.Fatalf("open installed catalog: %v", err)
+	}
+	if _, err := reopened.Resolve("codex-acp"); err != nil {
+		t.Fatalf("installed Agent is not resolvable: %v", err)
+	}
+}
+
+func TestSessionSpawnsInstalledAgentFromCatalogEntry(t *testing.T) {
+	dataDir := t.TempDir()
+	catalog, err := agentcatalog.Open(filepath.Join(dataDir, "agents.json"), filepath.Join(dataDir, "agents"))
+	if err != nil {
+		t.Fatalf("Open Agent catalog: %v", err)
+	}
+	_, err = catalog.Install(t.Context(), agentcatalog.RegistryAgent{
+		ID:      "codex-acp",
+		Name:    "Codex",
+		Version: "1.1.4",
+		Distribution: agentcatalog.Distribution{NPX: &agentcatalog.PackageDistribution{
+			Package: "@agentclientprotocol/codex-acp@1.1.4",
+			Args:    []string{"--stdio"},
+			Env:     map[string]string{"CODEX_MODE": "acp"},
+		}},
+	}, nil)
+	if err != nil {
+		t.Fatalf("install catalog Agent: %v", err)
+	}
+
+	spawned := false
+	connect := agentConnectorWithSpawner(
+		slog.New(slog.DiscardHandler),
+		catalog,
+		func(ctx context.Context, _ *slog.Logger, handlers agent.Handlers, command string, args []string, env map[string]string) (*agent.Conn, error) {
+			spawned = true
+			if command != "npx" {
+				t.Errorf("spawn command = %q, want npx", command)
+			}
+			if want := []string{"--yes", "@agentclientprotocol/codex-acp@1.1.4", "--stdio"}; !slices.Equal(args, want) {
+				t.Errorf("spawn args = %q, want %q", args, want)
+			}
+			if env["CODEX_MODE"] != "acp" {
+				t.Errorf("spawn env = %q, want CODEX_MODE", env)
+			}
+			return agent.ConnectScript(ctx, slog.New(slog.DiscardHandler), handlers, &agent.Script{})
+		},
+	)
+	manager, err := session.Open(
+		t.Context(), filepath.Join(dataDir, "sessions.db"), connect, &channel.Memory{},
+	)
+	if err != nil {
+		t.Fatalf("open Session manager: %v", err)
+	}
+	t.Cleanup(func() { _ = manager.Close() })
+	record, err := manager.Create(t.Context(), session.Create{
+		Agent:     "codex-acp",
+		Workspace: t.TempDir(),
+		Owner:     session.Owner{Channel: "test", ID: "developer"},
+	})
+	if err != nil {
+		t.Fatalf("create Session: %v", err)
+	}
+	if !spawned || record.Agent != "codex-acp" {
+		t.Errorf("created Session = %#v, spawned = %t", record, spawned)
+	}
+}
 
 func TestRunRejectsBadInvocationsWithUsage(t *testing.T) {
 	tests := []struct {
@@ -245,6 +357,21 @@ func TestRunFirstRunWritesConfigAndRunsTelegramChannelAcrossRestart(t *testing.T
 	t.Cleanup(server.Close)
 
 	dataDir := filepath.Join(t.TempDir(), "data")
+	installedCatalog, err := agentcatalog.Open(filepath.Join(dataDir, "agents.json"), filepath.Join(dataDir, "agents"))
+	if err != nil {
+		t.Fatalf("open Agent catalog: %v", err)
+	}
+	_, err = installedCatalog.Install(t.Context(), agentcatalog.RegistryAgent{
+		ID:      "codex-acp",
+		Name:    "Codex",
+		Version: "1.1.4",
+		Distribution: agentcatalog.Distribution{NPX: &agentcatalog.PackageDistribution{
+			Package: "@agentclientprotocol/codex-acp@1.1.4",
+		}},
+	}, nil)
+	if err != nil {
+		t.Fatalf("install Agent catalog fixture: %v", err)
+	}
 	workspace := t.TempDir()
 	input := strings.NewReader("valid-token\n-1001234567890\n123456789\n" + workspace + "\ncodex-acp\n")
 	var firstOutput strings.Builder
@@ -317,6 +444,32 @@ func TestRunReportsInvalidConfigWithoutLaunchingWizard(t *testing.T) {
 	}
 	if output.Len() != 0 {
 		t.Errorf("invalid existing config launched wizard: %q", output.String())
+	}
+}
+
+func TestRunRequiresConfiguredDefaultAgentInCatalog(t *testing.T) {
+	dataDir := t.TempDir()
+	configFile := filepath.Join(dataDir, "config.toml")
+	contents := `workspace = "/workspace"
+default_agent = "codex-acp"
+
+[rest]
+bearer_token = "rest-token"
+
+[telegram]
+bot_token = "token"
+chat_id = -1001
+allowed_user_ids = [123]
+`
+	if err := os.WriteFile(configFile, []byte(contents), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	err := run(
+		t.Context(), slog.New(slog.DiscardHandler), []string{"-data-dir", dataDir},
+		strings.NewReader(""), io.Discard, io.Discard, nil,
+	)
+	if err == nil || !strings.Contains(err.Error(), `default Agent "codex-acp" is not installed`) {
+		t.Fatalf("run error = %v, want missing catalog Agent error", err)
 	}
 }
 

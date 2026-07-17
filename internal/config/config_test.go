@@ -60,14 +60,18 @@ func TestPathsKeepAllPersistentFilesUnderDataDir(t *testing.T) {
 	}
 
 	want := map[string]string{
-		"config":   filepath.Join(dataDir, "config.toml"),
-		"database": filepath.Join(dataDir, "aethos.db"),
-		"logs":     filepath.Join(dataDir, "logs"),
+		"config":        filepath.Join(dataDir, "config.toml"),
+		"database":      filepath.Join(dataDir, "aethos.db"),
+		"agent catalog": filepath.Join(dataDir, "agents.json"),
+		"agents":        filepath.Join(dataDir, "agents"),
+		"logs":          filepath.Join(dataDir, "logs"),
 	}
 	got := map[string]string{
-		"config":   paths.ConfigFile,
-		"database": paths.DatabaseFile,
-		"logs":     paths.LogsDir,
+		"config":        paths.ConfigFile,
+		"database":      paths.DatabaseFile,
+		"agent catalog": paths.AgentCatalogFile,
+		"agents":        paths.AgentsDir,
+		"logs":          paths.LogsDir,
 	}
 	for name, wantPath := range want {
 		if got[name] != wantPath {

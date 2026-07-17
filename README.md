@@ -16,6 +16,7 @@ Coding agents are locked to terminal REPLs and IDE integrations. aethos lets you
 - **REST/SSE**: automation clients create Sessions, send Prompts, and stream events with a bearer token.
 - **Sessions that survive restarts**: state in a single SQLite database; live Sessions demote to dormant on idle and auto-resume on the next Prompt.
 - **One config file**: commented TOML written by a first-run wizard, with env-var overrides for secrets.
+- **Installable Agents**: browse the ACP registry from the CLI and install `npx` or platform-native binary Agents without replacing aethos.
 
 ## Design
 
@@ -26,13 +27,38 @@ Coding agents are locked to terminal REPLs and IDE integrations. aethos lets you
 
 The domain glossary lives in [CONTEXT.md](CONTEXT.md); code and review use its vocabulary exactly.
 
+## Agents
+
+Browse the official ACP registry, then install an Agent by its registry ID:
+
+```sh
+aethos agents
+aethos agents install codex-acp
+```
+
+Use `-data-dir` on either command, or `AETHOS_DATA_DIR`, to target a non-default
+data directory. Installed metadata is written to `agents.json`; binary Agents
+are downloaded beneath `agents/`. `npx` entries are pinned to the registry
+package version and downloaded by `npx` when first launched.
+
+Registry access is needed only while listing or installing. Startup and Session
+creation resolve installed Agents from the local catalog, including Agents
+installed by another CLI process while aethos is already running. A registry
+outage therefore does not prevent previously installed Agents from launching.
+
+Binary downloads are selected for the current operating system and CPU. aethos
+verifies a published SHA-256 checksum when present and supports raw binaries,
+`.zip`, `.tar.gz`, `.tgz`, `.tar.bz2`, and `.tbz2` archives.
+
 ## Configuration
 
-Run `aethos` with no command. If `config.toml` does not exist, the first-run
-wizard validates the Telegram bot token with Telegram, collects the forum
-supergroup and allowlisted user IDs, a Workspace, and the default Agent command,
-then writes a commented configuration file and starts the Telegram Channel.
-Later starts load that file without prompting.
+Install at least one Agent, then run `aethos` with no command. If `config.toml`
+does not exist, the first-run wizard validates the Telegram bot token with
+Telegram, collects the forum supergroup and allowlisted user IDs and a
+Workspace, offers the installed Agents for the default, then writes a commented
+configuration file and starts the Telegram Channel. Later starts load that file
+without prompting. `default_agent` stores an installed registry ID, not a shell
+command.
 
 The Telegram group must be a supergroup with Topics enabled. Add the bot as an
 administrator with permission to manage Topics, then give the wizard the
@@ -41,7 +67,7 @@ IDs that may use aethos. Messages from every other user are rejected and logged.
 
 At startup, aethos creates or reuses the Assistant Topic and posts its status.
 Send `/new` there to use the configured defaults, or
-`/new /absolute/workspace | agent command` to choose both. The new Session gets
+`/new /absolute/workspace | agent-id` to choose both. The new Session gets
 its own Topic; its first Prompt becomes the Session and Topic name. Plain
 messages sent to General are redirected to Assistant.
 
@@ -52,13 +78,14 @@ inside a Session Topic to stop its current Prompt without closing the Session.
 
 The data directory defaults to `~/.aethos/`. Override it with
 `aethos -data-dir /path/to/data` or `AETHOS_DATA_DIR`; configuration, database,
-and log paths are all rooted there. Environment values override the file:
+Agent catalog, installed binaries, and log paths are all rooted there.
+Environment values override the file:
 
 - `AETHOS_TELEGRAM_BOT_TOKEN` (keeps the token out of `config.toml`)
 - `AETHOS_REST_BEARER_TOKEN` (keeps the REST Channel token out of `config.toml`)
 - `AETHOS_REST_LISTEN_ADDRESS` (overrides the default `127.0.0.1:8080` socket)
 - `AETHOS_WORKSPACE`
-- `AETHOS_DEFAULT_AGENT`
+- `AETHOS_DEFAULT_AGENT` (an installed Agent registry ID)
 
 `idle_timeout` is a human-readable duration such as `"30m"` or `"2h"`. It
 defaults to 30 minutes and controls how long a live Session with no Prompt work

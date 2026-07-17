@@ -59,7 +59,7 @@ func (c *Channel) handleAssistant(ctx context.Context, message *message) error {
 		return err
 	}
 
-	workspace, agentCommand, err := c.sessionSelection(argument)
+	workspace, agentID, err := c.sessionSelection(argument)
 	if err != nil {
 		_, sendErr := c.client.sendMessage(ctx, c.settings.Token, c.settings.ChatID, c.assistantTopicID, err.Error())
 		return errors.Join(err, sendErr)
@@ -69,7 +69,7 @@ func (c *Channel) handleAssistant(ctx context.Context, message *message) error {
 		return fmt.Errorf("create Session Topic: %w", err)
 	}
 	record, err := c.sessions.Create(ctx, session.Create{
-		Agent:     agentCommand,
+		Agent:     agentID,
 		Workspace: workspace,
 		Owner: session.Owner{
 			Channel: "telegram",
@@ -192,17 +192,17 @@ func (c *Channel) sessionSelection(argument string) (string, string, error) {
 	if argument == "" {
 		return c.settings.Workspace, c.settings.DefaultAgent, nil
 	}
-	workspace, agentCommand, found := strings.Cut(argument, "|")
+	workspace, agentID, found := strings.Cut(argument, "|")
 	if !found {
-		return "", "", fmt.Errorf("usage: /new <Workspace> | <Agent command>")
+		return "", "", fmt.Errorf("usage: /new <Workspace> | <installed Agent ID>")
 	}
 	workspace = strings.TrimSpace(workspace)
-	agentCommand = strings.TrimSpace(agentCommand)
+	agentID = strings.TrimSpace(agentID)
 	if workspace == "" {
 		workspace = c.settings.Workspace
 	}
-	if agentCommand == "" {
-		agentCommand = c.settings.DefaultAgent
+	if agentID == "" {
+		agentID = c.settings.DefaultAgent
 	}
 	if !filepath.IsAbs(workspace) {
 		return "", "", fmt.Errorf("workspace must be an absolute path")
@@ -214,5 +214,5 @@ func (c *Channel) sessionSelection(argument string) (string, string, error) {
 	if !info.IsDir() {
 		return "", "", fmt.Errorf("workspace %q is not a directory", workspace)
 	}
-	return workspace, agentCommand, nil
+	return workspace, agentID, nil
 }
