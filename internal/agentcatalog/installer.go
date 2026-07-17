@@ -186,7 +186,7 @@ func extractTar(reader *tar.Reader, destination string) error {
 			if err := os.MkdirAll(path, 0o700); err != nil {
 				return fmt.Errorf("create archive directory %q: %w", header.Name, err)
 			}
-		case tar.TypeReg, tar.TypeRegA:
+		case tar.TypeReg:
 			if header.Size < 0 || extracted > maxExtractedBytes-header.Size {
 				return fmt.Errorf("extract tar binary archive: contents exceed %d bytes", maxExtractedBytes)
 			}

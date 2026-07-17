@@ -308,7 +308,7 @@ func installAgentCommand(
 		}
 	}
 	if selected == nil {
-		return fmt.Errorf("Agent %q was not found in the ACP registry", agentID)
+		return fmt.Errorf("agent %q was not found in the ACP registry", agentID)
 	}
 	dataDir, err := config.ResolveDataDir(*dataDirFlag)
 	if err != nil {
@@ -449,7 +449,7 @@ func devPromptWithConnector(
 func agentConnector(logger *slog.Logger, catalog *agentcatalog.Catalog) session.Connect {
 	return func(ctx context.Context, ref session.AgentRef, handlers agent.Handlers) (*agent.Conn, error) {
 		if catalog == nil {
-			return nil, fmt.Errorf("Agent catalog is unavailable")
+			return nil, fmt.Errorf("agent catalog is unavailable")
 		}
 		installed, err := catalog.Resolve(string(ref))
 		if err != nil {

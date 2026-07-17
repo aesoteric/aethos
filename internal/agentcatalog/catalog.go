@@ -97,10 +97,10 @@ type Catalog struct {
 // Open loads an Agent catalog, treating a missing file as an empty catalog.
 func Open(path, agentsDir string) (*Catalog, error) {
 	if !filepath.IsAbs(path) {
-		return nil, fmt.Errorf("Agent catalog path must be absolute, got %q", path)
+		return nil, fmt.Errorf("agent catalog path must be absolute, got %q", path)
 	}
 	if !filepath.IsAbs(agentsDir) {
-		return nil, fmt.Errorf("Agent installation directory must be absolute, got %q", agentsDir)
+		return nil, fmt.Errorf("agent installation directory must be absolute, got %q", agentsDir)
 	}
 	catalog := &Catalog{
 		path:      filepath.Clean(path),
@@ -187,7 +187,7 @@ func (c *Catalog) Resolve(id string) (InstalledAgent, error) {
 	}
 	installed, ok := c.agents[strings.TrimSpace(id)]
 	if !ok {
-		return InstalledAgent{}, fmt.Errorf("Agent %q is not installed", id)
+		return InstalledAgent{}, fmt.Errorf("agent %q is not installed", id)
 	}
 	return cloneInstalledAgent(installed), nil
 }
@@ -222,7 +222,7 @@ func (c *Catalog) refreshLocked() error {
 		return fmt.Errorf("parse Agent catalog %q: %w", c.path, err)
 	}
 	if persisted.Version != catalogVersion {
-		return fmt.Errorf("Agent catalog %q has unsupported version %d", c.path, persisted.Version)
+		return fmt.Errorf("agent catalog %q has unsupported version %d", c.path, persisted.Version)
 	}
 	if persisted.Agents == nil {
 		persisted.Agents = make(map[string]InstalledAgent)
@@ -286,6 +286,6 @@ func cloneMap(source map[string]string) map[string]string {
 }
 
 func cloneInstalledAgent(installed InstalledAgent) InstalledAgent {
-	installed.Launch = installed.Launch.Clone()
+	installed.Launch = installed.Clone()
 	return installed
 }
