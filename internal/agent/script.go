@@ -102,6 +102,34 @@ func ConnectScript(
 	return connect(ctx, logger, handlers, clientToAgentW, agentToClientR, shutdown, lifecycle)
 }
 
+// ServeScript runs the scripted ACP Agent on a subprocess-style stdio edge.
+// It lets integration tests exercise the real spawn path without a live Agent.
+func ServeScript(
+	ctx context.Context,
+	logger *slog.Logger,
+	script *Script,
+	input io.Reader,
+	output io.Writer,
+) error {
+	if script == nil {
+		return fmt.Errorf("script is required")
+	}
+	fake := &scriptedAgent{
+		script:   script,
+		attached: make(map[string]bool),
+		active:   make(map[string]chan struct{}),
+	}
+	fake.crash = func(error) {}
+	fake.conn = sdk.NewAgentSideConnection(fake, output, input)
+	fake.conn.SetLogger(logger)
+	select {
+	case <-fake.conn.Done():
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // EventLog is a race-safe event collector for flow tests: pass Record as
 // the EventHandler, drive the Conn, then assert on Snapshot. It belongs
 // to the same agent-edge test harness as Script.

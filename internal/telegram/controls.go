@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/aesoteric/aethos/internal/agentcatalog"
 	"github.com/aesoteric/aethos/internal/session"
 )
 
@@ -48,6 +49,8 @@ func telegramCommand(text string) (string, string) {
 func (c *Channel) handleAssistant(ctx context.Context, message *message) error {
 	command, argument := telegramCommand(message.Text)
 	switch command {
+	case "/agents":
+		return c.sendAgentList(ctx)
 	case "/sessions":
 		return c.sendSessionList(ctx)
 	case "/close":
@@ -55,7 +58,7 @@ func (c *Channel) handleAssistant(ctx context.Context, message *message) error {
 	case "/new":
 	default:
 		_, err := c.client.sendMessage(ctx, c.settings.Token, c.settings.ChatID, c.assistantTopicID,
-			"Send /new to create a Session, /sessions to list Sessions, or /close <Session ID> to close one.")
+			"Send /agents to list installed Agents, /new to create a Session, /sessions to list Sessions, or /close <Session ID> to close one.")
 		return err
 	}
 
@@ -86,6 +89,32 @@ func (c *Channel) handleAssistant(ctx context.Context, message *message) error {
 		return fmt.Errorf("post Session status: %w", err)
 	}
 	return nil
+}
+
+func (c *Channel) sendAgentList(ctx context.Context) error {
+	var installed []agentcatalog.InstalledAgent
+	if c.settings.Agents != nil {
+		var err error
+		installed, err = c.settings.Agents.Installed()
+		if err != nil {
+			return err
+		}
+	}
+	if len(installed) == 0 {
+		_, err := c.client.sendMessage(
+			ctx, c.settings.Token, c.settings.ChatID, c.assistantTopicID, "No Agents are installed.",
+		)
+		return err
+	}
+	var text strings.Builder
+	text.WriteString("Installed Agents:")
+	for _, installedAgent := range installed {
+		fmt.Fprintf(&text, "\n%s — %s (%s)", installedAgent.ID, installedAgent.Name, installedAgent.Type)
+	}
+	_, err := c.client.sendMessage(
+		ctx, c.settings.Token, c.settings.ChatID, c.assistantTopicID, text.String(),
+	)
+	return err
 }
 
 func (c *Channel) sendSessionList(ctx context.Context) error {

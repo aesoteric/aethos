@@ -76,43 +76,45 @@ func TestAgentsCommandListsAndInstallsRegistryAgent(t *testing.T) {
 }
 
 func TestSessionSpawnsInstalledAgentFromCatalogEntry(t *testing.T) {
+	executablePath, err := os.Executable()
+	if err != nil {
+		t.Fatalf("find test executable: %v", err)
+	}
+	executable, err := os.ReadFile(executablePath)
+	if err != nil {
+		t.Fatalf("read test executable: %v", err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(executable)
+	}))
+	t.Cleanup(server.Close)
+	platform, err := agentcatalog.CurrentPlatform()
+	if err != nil {
+		t.Fatalf("CurrentPlatform: %v", err)
+	}
 	dataDir := t.TempDir()
 	catalog, err := agentcatalog.Open(filepath.Join(dataDir, "agents.json"), filepath.Join(dataDir, "agents"))
 	if err != nil {
 		t.Fatalf("Open Agent catalog: %v", err)
 	}
 	_, err = catalog.Install(t.Context(), agentcatalog.RegistryAgent{
-		ID:      "codex-acp",
-		Name:    "Codex",
-		Version: "1.1.4",
-		Distribution: agentcatalog.Distribution{NPX: &agentcatalog.PackageDistribution{
-			Package: "@agentclientprotocol/codex-acp@1.1.4",
-			Args:    []string{"--stdio"},
-			Env:     map[string]string{"CODEX_MODE": "acp"},
+		ID:      "test-agent",
+		Name:    "Test Agent",
+		Version: "1.0.0",
+		Distribution: agentcatalog.Distribution{Binary: map[string]agentcatalog.BinaryDistribution{
+			platform: {
+				Archive: server.URL + "/test-agent",
+				Command: "./test-agent",
+				Args:    []string{"-test.run=^TestAgentSubprocessHelper$"},
+				Env:     map[string]string{"AETHOS_TEST_AGENT_HELPER": "catalog-entry"},
+			},
 		}},
-	}, nil)
+	}, server.Client())
 	if err != nil {
 		t.Fatalf("install catalog Agent: %v", err)
 	}
 
-	spawned := false
-	connect := agentConnectorWithSpawner(
-		slog.New(slog.DiscardHandler),
-		catalog,
-		func(ctx context.Context, _ *slog.Logger, handlers agent.Handlers, command string, args []string, env map[string]string) (*agent.Conn, error) {
-			spawned = true
-			if command != "npx" {
-				t.Errorf("spawn command = %q, want npx", command)
-			}
-			if want := []string{"--yes", "@agentclientprotocol/codex-acp@1.1.4", "--stdio"}; !slices.Equal(args, want) {
-				t.Errorf("spawn args = %q, want %q", args, want)
-			}
-			if env["CODEX_MODE"] != "acp" {
-				t.Errorf("spawn env = %q, want CODEX_MODE", env)
-			}
-			return agent.ConnectScript(ctx, slog.New(slog.DiscardHandler), handlers, &agent.Script{})
-		},
-	)
+	connect := agentConnector(slog.New(slog.DiscardHandler), catalog)
 	manager, err := session.Open(
 		t.Context(), filepath.Join(dataDir, "sessions.db"), connect, &channel.Memory{},
 	)
@@ -121,15 +123,27 @@ func TestSessionSpawnsInstalledAgentFromCatalogEntry(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = manager.Close() })
 	record, err := manager.Create(t.Context(), session.Create{
-		Agent:     "codex-acp",
+		Agent:     "test-agent",
 		Workspace: t.TempDir(),
 		Owner:     session.Owner{Channel: "test", ID: "developer"},
 	})
 	if err != nil {
 		t.Fatalf("create Session: %v", err)
 	}
-	if !spawned || record.Agent != "codex-acp" {
-		t.Errorf("created Session = %#v, spawned = %t", record, spawned)
+	if record.Agent != "test-agent" {
+		t.Errorf("created Session = %#v, want catalog Agent ID", record)
+	}
+}
+
+func TestAgentSubprocessHelper(t *testing.T) {
+	if os.Getenv("AETHOS_TEST_AGENT_HELPER") != "catalog-entry" {
+		return
+	}
+	if err := agent.ServeScript(
+		context.Background(), slog.New(slog.DiscardHandler), &agent.Script{}, os.Stdin, os.Stdout,
+	); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
 	}
 }
 

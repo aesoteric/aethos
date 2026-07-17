@@ -14,6 +14,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/aesoteric/aethos/internal/agent"
+	"github.com/aesoteric/aethos/internal/agentcatalog"
 	channeltypes "github.com/aesoteric/aethos/internal/channel"
 	"github.com/aesoteric/aethos/internal/config"
 	"github.com/aesoteric/aethos/internal/session"
@@ -35,6 +36,7 @@ type Settings struct {
 	AllowedUserIDs []int64
 	DefaultAgent   string
 	Workspace      string
+	Agents         agentcatalog.InstalledLister
 }
 
 // Option configures Telegram Channel timing at external boundaries.
@@ -312,7 +314,7 @@ func (c *Channel) bootstrapAssistant(ctx context.Context) error {
 		c.assistantTopicID = topicID
 		c.mu.Unlock()
 	}
-	status := "aethos is online. Send /new to create a Session, or /sessions to list and close Sessions."
+	status := "aethos is online. Send /agents to list installed Agents, /new to create a Session, or /sessions to list and close Sessions."
 	if _, err := c.client.sendMessage(ctx, c.settings.Token, c.settings.ChatID, topicID, status); err != nil {
 		return fmt.Errorf("post Assistant status: %w", err)
 	}

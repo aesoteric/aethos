@@ -76,6 +76,11 @@ type InstalledAgent struct {
 	Env         map[string]string `json:"env,omitempty"`
 }
 
+// InstalledLister supplies the current Agent choices to setup and Channels.
+type InstalledLister interface {
+	Installed() ([]InstalledAgent, error)
+}
+
 type catalogFile struct {
 	Version int                       `json:"version"`
 	Agents  map[string]InstalledAgent `json:"agents"`
@@ -131,8 +136,8 @@ func (c *Catalog) Install(ctx context.Context, registryAgent RegistryAgent, clie
 		Description: registryAgent.Description,
 	}
 	removeBinaryOnFailure := false
-	switch {
-	case registryAgent.Distribution.NPX != nil:
+	switch registryAgent.Type() {
+	case NPX:
 		packageName := strings.TrimSpace(registryAgent.Distribution.NPX.Package)
 		if packageName == "" {
 			return InstalledAgent{}, fmt.Errorf("install Agent %q: npx package is required", id)
@@ -141,7 +146,7 @@ func (c *Catalog) Install(ctx context.Context, registryAgent RegistryAgent, clie
 		installed.Command = "npx"
 		installed.Args = append([]string{"--yes", packageName}, registryAgent.Distribution.NPX.Args...)
 		installed.Env = cloneMap(registryAgent.Distribution.NPX.Env)
-	case len(registryAgent.Distribution.Binary) > 0:
+	case Binary:
 		platform, err := CurrentPlatform()
 		if err != nil {
 			return InstalledAgent{}, fmt.Errorf("install Agent %q: %w", id, err)
@@ -184,9 +189,7 @@ func (c *Catalog) Resolve(id string) (InstalledAgent, error) {
 	if !ok {
 		return InstalledAgent{}, fmt.Errorf("Agent %q is not installed", id)
 	}
-	installed.Args = append([]string(nil), installed.Args...)
-	installed.Env = cloneMap(installed.Env)
-	return installed, nil
+	return cloneInstalledAgent(installed), nil
 }
 
 // Installed returns every installed Agent in stable ID order.
@@ -198,9 +201,7 @@ func (c *Catalog) Installed() ([]InstalledAgent, error) {
 	}
 	installed := make([]InstalledAgent, 0, len(c.agents))
 	for _, agent := range c.agents {
-		agent.Args = append([]string(nil), agent.Args...)
-		agent.Env = cloneMap(agent.Env)
-		installed = append(installed, agent)
+		installed = append(installed, cloneInstalledAgent(agent))
 	}
 	sort.Slice(installed, func(i, j int) bool { return installed[i].ID < installed[j].ID })
 	return installed, nil
@@ -282,4 +283,10 @@ func cloneMap(source map[string]string) map[string]string {
 		cloned[key] = value
 	}
 	return cloned
+}
+
+func cloneInstalledAgent(installed InstalledAgent) InstalledAgent {
+	installed.Args = append([]string(nil), installed.Args...)
+	installed.Env = cloneMap(installed.Env)
+	return installed
 }

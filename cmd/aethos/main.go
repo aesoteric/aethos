@@ -187,6 +187,7 @@ func runWithRegistry(
 			AllowedUserIDs: configured.Telegram.AllowedUserIDs,
 			DefaultAgent:   configured.DefaultAgent,
 			Workspace:      configured.Workspace,
+			Agents:         catalog,
 		},
 	)
 	if err != nil {
@@ -196,6 +197,7 @@ func runWithRegistry(
 		ListenAddress: configured.REST.ListenAddress,
 		BearerToken:   configured.REST.BearerToken,
 		Identity:      "api",
+		Agents:        catalog,
 	}, logger)
 	if err != nil {
 		return errors.Join(err, bridge.Close())
@@ -444,26 +446,7 @@ func devPromptWithConnector(
 	return record.ID, nil
 }
 
-type agentSpawner func(
-	context.Context,
-	*slog.Logger,
-	agent.Handlers,
-	string,
-	[]string,
-	map[string]string,
-) (*agent.Conn, error)
-
 func agentConnector(logger *slog.Logger, catalog *agentcatalog.Catalog) session.Connect {
-	return agentConnectorWithSpawner(
-		logger,
-		catalog,
-		func(ctx context.Context, logger *slog.Logger, handlers agent.Handlers, command string, args []string, env map[string]string) (*agent.Conn, error) {
-			return agent.SpawnWithEnvironment(ctx, logger, handlers, env, command, args...)
-		},
-	)
-}
-
-func agentConnectorWithSpawner(logger *slog.Logger, catalog *agentcatalog.Catalog, spawn agentSpawner) session.Connect {
 	return func(ctx context.Context, id string, handlers agent.Handlers) (*agent.Conn, error) {
 		if catalog == nil {
 			return nil, fmt.Errorf("Agent catalog is unavailable")
@@ -472,7 +455,9 @@ func agentConnectorWithSpawner(logger *slog.Logger, catalog *agentcatalog.Catalo
 		if err != nil {
 			return nil, err
 		}
-		return spawn(ctx, logger, handlers, installed.Command, installed.Args, installed.Env)
+		return agent.SpawnWithEnvironment(
+			ctx, logger, handlers, installed.Env, installed.Command, installed.Args...,
+		)
 	}
 }
 

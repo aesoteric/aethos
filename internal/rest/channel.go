@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/aesoteric/aethos/internal/agent"
+	"github.com/aesoteric/aethos/internal/agentcatalog"
 	"github.com/aesoteric/aethos/internal/channel"
 	"github.com/aesoteric/aethos/internal/permission"
 	"github.com/aesoteric/aethos/internal/session"
@@ -33,6 +34,7 @@ type Settings struct {
 	ListenAddress string
 	BearerToken   string
 	Identity      string
+	Agents        agentcatalog.InstalledLister
 }
 
 type sessionTarget interface {
@@ -142,6 +144,8 @@ func (c *Channel) Handler(sessions sessionTarget) http.Handler {
 			return
 		}
 		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/agents":
+			c.listAgents(w)
 		case r.Method == http.MethodPost && r.URL.Path == "/sessions":
 			c.createSession(w, r, sessions)
 		case r.Method == http.MethodGet && r.URL.Path == "/sessions":
@@ -158,6 +162,35 @@ func (c *Channel) Handler(sessions sessionTarget) http.Handler {
 			writeError(w, http.StatusNotFound, "endpoint not found")
 		}
 	})
+}
+
+func (c *Channel) listAgents(w http.ResponseWriter) {
+	agents := []agentcatalog.InstalledAgent{}
+	if c.settings.Agents != nil {
+		var err error
+		agents, err = c.settings.Agents.Installed()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+	type agentResponse struct {
+		ID          string                        `json:"id"`
+		Name        string                        `json:"name"`
+		Version     string                        `json:"version"`
+		Description string                        `json:"description"`
+		Type        agentcatalog.DistributionType `json:"type"`
+	}
+	response := make([]agentResponse, 0, len(agents))
+	for _, installed := range agents {
+		response = append(response, agentResponse{
+			ID: installed.ID, Name: installed.Name, Version: installed.Version,
+			Description: installed.Description, Type: installed.Type,
+		})
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Agents []agentResponse `json:"agents"`
+	}{Agents: response})
 }
 
 func (c *Channel) answerPermission(w http.ResponseWriter, r *http.Request, sessions sessionTarget) {

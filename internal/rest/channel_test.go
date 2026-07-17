@@ -15,10 +15,51 @@ import (
 	"time"
 
 	"github.com/aesoteric/aethos/internal/agent"
+	"github.com/aesoteric/aethos/internal/agentcatalog"
 	"github.com/aesoteric/aethos/internal/channel"
 	"github.com/aesoteric/aethos/internal/rest"
 	"github.com/aesoteric/aethos/internal/session"
 )
+
+type staticAgentCatalog []agentcatalog.InstalledAgent
+
+func (c staticAgentCatalog) Installed() ([]agentcatalog.InstalledAgent, error) {
+	return append([]agentcatalog.InstalledAgent(nil), c...), nil
+}
+
+func TestAuthenticatedClientListsInstalledAgents(t *testing.T) {
+	api, err := rest.New(rest.Settings{
+		ListenAddress: "127.0.0.1:0",
+		BearerToken:   "test-token",
+		Identity:      "api",
+		Agents: staticAgentCatalog{
+			{ID: "codex-acp", Name: "Codex", Version: "1.1.4", Description: "ACP integration for Codex", Type: agentcatalog.NPX},
+			{ID: "goose", Name: "goose", Version: "1.43.0", Description: "An open source coding Agent", Type: agentcatalog.Binary},
+		},
+	}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("open REST Channel: %v", err)
+	}
+	response := request(t, api.Handler(nil), http.MethodGet, "/agents", "test-token", nil)
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("GET /agents status = %d, want %d", response.StatusCode, http.StatusOK)
+	}
+	var body struct {
+		Agents []struct {
+			ID          string `json:"id"`
+			Name        string `json:"name"`
+			Type        string `json:"type"`
+			Description string `json:"description"`
+		} `json:"agents"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+		t.Fatalf("decode installed Agents: %v", err)
+	}
+	if len(body.Agents) != 2 || body.Agents[0].ID != "codex-acp" || body.Agents[0].Type != "npx" || body.Agents[1].ID != "goose" {
+		t.Errorf("installed Agents = %#v, want catalog choices", body.Agents)
+	}
+}
 
 func TestClientStreamsAgentOutputAsItHappens(t *testing.T) {
 	api, manager := openRESTFlow(t, &agent.Script{Turns: []agent.Turn{{

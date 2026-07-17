@@ -17,10 +17,26 @@ import (
 	"time"
 
 	"github.com/aesoteric/aethos/internal/agent"
+	"github.com/aesoteric/aethos/internal/agentcatalog"
 	"github.com/aesoteric/aethos/internal/channel"
 	"github.com/aesoteric/aethos/internal/session"
 	"github.com/aesoteric/aethos/internal/telegram"
 )
+
+type staticAgentCatalog []agentcatalog.InstalledAgent
+
+func (c staticAgentCatalog) Installed() ([]agentcatalog.InstalledAgent, error) {
+	return append([]agentcatalog.InstalledAgent(nil), c...), nil
+}
+
+func TestAssistantListsInstalledAgents(t *testing.T) {
+	flow := newTelegramFlow(t, readUpdateFixture(t, "agents_command.json"), &agent.Script{})
+	flow.run(t)
+	waitFor(t, func() bool {
+		return flow.api.hasVisibleMessage(101, "codex-acp — Codex (npx)") &&
+			flow.api.hasVisibleMessage(101, "goose — goose (binary)")
+	})
+}
 
 func TestTelegramChannelDrivesSessionFlowThroughFixtureUpdates(t *testing.T) {
 	fixture, err := os.ReadFile(filepath.Join("testdata", "session_flow.json"))
@@ -144,6 +160,10 @@ func TestTelegramChannelBatchesStreamingEventsIntoMessageEdits(t *testing.T) {
 			AllowedUserIDs: []int64{123456789},
 			DefaultAgent:   "agent",
 			Workspace:      "/workspace",
+			Agents: staticAgentCatalog{
+				{ID: "codex-acp", Name: "Codex", Type: agentcatalog.NPX},
+				{ID: "goose", Name: "goose", Type: agentcatalog.Binary},
+			},
 		},
 		telegram.WithWriteInterval(time.Millisecond),
 		telegram.WithPollTimeout(time.Second),
@@ -475,6 +495,10 @@ func newTelegramFlow(t *testing.T, fixture []byte, script *agent.Script, options
 			AllowedUserIDs: []int64{123456789},
 			DefaultAgent:   "agent",
 			Workspace:      "/workspace",
+			Agents: staticAgentCatalog{
+				{ID: "codex-acp", Name: "Codex", Type: agentcatalog.NPX},
+				{ID: "goose", Name: "goose", Type: agentcatalog.Binary},
+			},
 		},
 		telegram.WithWriteInterval(time.Millisecond),
 		telegram.WithPollTimeout(time.Second),

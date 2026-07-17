@@ -66,7 +66,8 @@ negative group ID (usually beginning with `-100`) and the numeric Telegram user
 IDs that may use aethos. Messages from every other user are rejected and logged.
 
 At startup, aethos creates or reuses the Assistant Topic and posts its status.
-Send `/new` there to use the configured defaults, or
+Send `/agents` there to see the installed Agent IDs available for Session
+creation. Send `/new` to use the configured defaults, or
 `/new /absolute/workspace | agent-id` to choose both. The new Session gets
 its own Topic; its first Prompt becomes the Session and Topic name. Plain
 messages sent to General are redirected to Assistant.
@@ -117,6 +118,7 @@ and reports whether Session control is ready. Every other route requires
 `AETHOS_REST_BEARER_TOKEN`:
 
 - `POST /sessions` with `{"agent":"...","workspace":"/absolute/path"}`
+- `GET /agents` (installed Agent choices for `POST /sessions`)
 - `GET /sessions`
 - `GET /sessions/{id}`
 - `GET /sessions/{id}/events` (SSE)
