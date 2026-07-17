@@ -83,6 +83,17 @@ jobs:
             "$image" version)"
           grep -Eq '^aethos [^ ]+ \(commit [^,]+, built [^)]+\)$' <<<"$output"
           ! grep -Fq 'aethos dev ' <<<"$output"
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            --mount "type=bind,src=$container_data,dst=/data" \
+            "$image" agents install opencode
+          test -s "$container_data/aethos/agents.json"
+          test -x "$container_data/aethos/agents/opencode/opencode"
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            --mount "type=bind,src=$container_data,dst=/data" \
+            --entrypoint /data/aethos/agents/opencode/opencode \
+            "$image" --version
       - name: Verify systemd unit
         shell: bash
         run: |

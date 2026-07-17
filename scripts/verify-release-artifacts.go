@@ -6,6 +6,7 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"crypto/sha256"
+	"debug/buildinfo"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -22,9 +23,6 @@ type artifact struct {
 	GoOS   string `json:"goos"`
 	GoArch string `json:"goarch"`
 	Type   string `json:"type"`
-	Extra  struct {
-		DynamicallyLinked bool `json:"DynamicallyLinked"`
-	} `json:"extra"`
 }
 
 type target struct {
@@ -74,8 +72,8 @@ func verify(dist string) error {
 		if err != nil {
 			return err
 		}
-		if binary.Extra.DynamicallyLinked {
-			return fmt.Errorf("%s/%s binary is dynamically linked", expected.goos, expected.goarch)
+		if err := verifyCGODisabled(binary.Path); err != nil {
+			return fmt.Errorf("%s/%s binary: %w", expected.goos, expected.goarch, err)
 		}
 		archive, err := exactlyOne(artifacts, expected, "Archive")
 		if err != nil {
@@ -104,6 +102,23 @@ func exactlyOne(artifacts []artifact, expected target, artifactType string) (art
 		)
 	}
 	return matches[0], nil
+}
+
+func verifyCGODisabled(path string) error {
+	info, err := buildinfo.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read Go build information: %w", err)
+	}
+	for _, setting := range info.Settings {
+		if setting.Key != "CGO_ENABLED" {
+			continue
+		}
+		if setting.Value != "0" {
+			return fmt.Errorf("CGO_ENABLED = %q, want %q", setting.Value, "0")
+		}
+		return nil
+	}
+	return fmt.Errorf("Go build information has no CGO_ENABLED setting")
 }
 
 func readChecksums(path string) (map[string]string, error) {

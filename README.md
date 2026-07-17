@@ -4,9 +4,9 @@ A self-hosted bridge that connects AI coding agents — Claude Code, Codex, Gemi
 
 [![CI](https://github.com/aesoteric/aethos/actions/workflows/ci.yml/badge.svg)](https://github.com/aesoteric/aethos/actions/workflows/ci.yml)
 
-> **Current release: v0.1.0.** Release archives are available for Linux and
-> macOS on amd64 and arm64, together with a multi-architecture distroless image.
-> The [v1 spec](https://github.com/aesoteric/aethos/issues/1) tracks what comes next.
+> **Release line: v0.1.0.** Tag pushes publish archives for Linux and macOS on
+> amd64 and arm64, together with a multi-architecture distroless image. The
+> [v1 spec](https://github.com/aesoteric/aethos/issues/1) tracks what comes next.
 
 ## Why
 
