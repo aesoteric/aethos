@@ -149,11 +149,18 @@ type managedSession struct {
 	record         Record
 	agentSessionID string
 	conn           *agent.Conn
+	// ending prevents Prompt completion or resume from overtaking crash delivery.
+	ending         *connectionEnd
 	queue          []*promptCall
 	current        *promptCall
 	working        bool
 	closing        bool
 	idleTimer      *time.Timer
+}
+
+type connectionEnd struct {
+	conn *agent.Conn
+	done chan struct{}
 }
 
 type promptCall struct {
@@ -530,6 +537,16 @@ func (m *Manager) surfaceState(id string, state State) {
 
 func (m *Manager) liveConnection(ctx context.Context, id string, managed *managedSession) (*agent.Conn, error) {
 	managed.mu.Lock()
+	for managed.ending != nil {
+		ending := managed.ending
+		managed.mu.Unlock()
+		select {
+		case <-ending.done:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		managed.mu.Lock()
+	}
 	if managed.closing {
 		managed.mu.Unlock()
 		return nil, ErrSessionClosed
@@ -593,6 +610,15 @@ func (m *Manager) connectionEnded(id string, managed *managedSession, conn *agen
 		return
 	}
 	managed.mu.Lock()
+	if managed.ending != nil {
+		ending := managed.ending
+		managed.mu.Unlock()
+		m.mu.Unlock()
+		if ending.conn == conn {
+			<-ending.done
+		}
+		return
+	}
 	if managed.conn != conn || managed.record.State != Live {
 		managed.mu.Unlock()
 		m.mu.Unlock()
@@ -606,12 +632,20 @@ func (m *Manager) connectionEnded(id string, managed *managedSession, conn *agen
 		m.mu.Unlock()
 		return
 	}
+	ending := &connectionEnd{conn: conn, done: make(chan struct{})}
+	managed.ending = ending
 	m.stopIdleLocked(managed)
 	managed.conn = nil
 	managed.record.State = Dormant
 	managed.record.LastActivityAt = now
 	managed.mu.Unlock()
 	m.mu.Unlock()
+	defer func() {
+		managed.mu.Lock()
+		managed.ending = nil
+		close(ending.done)
+		managed.mu.Unlock()
+	}()
 	m.surfaceState(id, Dormant)
 
 	exitErr := conn.ExitError()
