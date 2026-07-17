@@ -14,6 +14,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+
+	"github.com/aesoteric/aethos/internal/agent"
 )
 
 const catalogVersion = 1
@@ -66,14 +68,12 @@ type RegistryAgent struct {
 
 // InstalledAgent is a durable, directly launchable catalog entry.
 type InstalledAgent struct {
-	ID          string            `json:"id"`
-	Name        string            `json:"name"`
-	Version     string            `json:"version"`
-	Description string            `json:"description"`
-	Type        DistributionType  `json:"type"`
-	Command     string            `json:"command"`
-	Args        []string          `json:"args,omitempty"`
-	Env         map[string]string `json:"env,omitempty"`
+	ID          string           `json:"id"`
+	Name        string           `json:"name"`
+	Version     string           `json:"version"`
+	Description string           `json:"description"`
+	Type        DistributionType `json:"type"`
+	agent.Launch
 }
 
 // InstalledLister supplies the current Agent choices to setup and Channels.
@@ -286,7 +286,6 @@ func cloneMap(source map[string]string) map[string]string {
 }
 
 func cloneInstalledAgent(installed InstalledAgent) InstalledAgent {
-	installed.Args = append([]string(nil), installed.Args...)
-	installed.Env = cloneMap(installed.Env)
+	installed.Launch = installed.Launch.Clone()
 	return installed
 }

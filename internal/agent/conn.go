@@ -30,6 +30,27 @@ type Conn struct {
 	eventErrors  map[string]error
 }
 
+// Launch is the complete subprocess definition for an installed Agent.
+type Launch struct {
+	Command string            `json:"command"`
+	Args    []string          `json:"args,omitempty"`
+	Env     map[string]string `json:"env,omitempty"`
+}
+
+// Clone returns a launch definition whose mutable fields do not alias the
+// original.
+func (launch Launch) Clone() Launch {
+	launch.Args = append([]string(nil), launch.Args...)
+	if launch.Env != nil {
+		environment := make(map[string]string, len(launch.Env))
+		for key, value := range launch.Env {
+			environment[key] = value
+		}
+		launch.Env = environment
+	}
+	return launch
+}
+
 type connectionLifecycle struct {
 	done chan struct{}
 	once sync.Once
@@ -66,7 +87,7 @@ func Spawn(
 	name string,
 	args ...string,
 ) (*Conn, error) {
-	return SpawnWithEnvironment(ctx, logger, handlers, nil, name, args...)
+	return SpawnLaunch(ctx, logger, handlers, Launch{Command: name, Args: args})
 }
 
 // SpawnWithEnvironment launches an ACP Agent with catalog-provided
@@ -79,12 +100,22 @@ func SpawnWithEnvironment(
 	name string,
 	args ...string,
 ) (*Conn, error) {
+	return SpawnLaunch(ctx, logger, handlers, Launch{Command: name, Args: args, Env: environment})
+}
+
+// SpawnLaunch launches an ACP Agent from one typed launch definition.
+func SpawnLaunch(
+	ctx context.Context,
+	logger *slog.Logger,
+	handlers Handlers,
+	launch Launch,
+) (*Conn, error) {
 	// Conn owns the subprocess lifetime. The caller's context bounds startup and
 	// protocol operations; Close is the single place that terminates the Agent.
-	cmd := exec.Command(name, args...)
-	if len(environment) > 0 {
-		keys := make([]string, 0, len(environment))
-		for key := range environment {
+	cmd := exec.Command(launch.Command, launch.Args...)
+	if len(launch.Env) > 0 {
+		keys := make([]string, 0, len(launch.Env))
+		for key := range launch.Env {
 			if key == "" || strings.ContainsRune(key, '=') {
 				return nil, fmt.Errorf("invalid Agent environment variable name %q", key)
 			}
@@ -95,12 +126,12 @@ func SpawnWithEnvironment(
 		cmd.Env = make([]string, 0, len(base)+len(keys))
 		for _, assignment := range base {
 			key, _, _ := strings.Cut(assignment, "=")
-			if _, overridden := environment[key]; !overridden {
+			if _, overridden := launch.Env[key]; !overridden {
 				cmd.Env = append(cmd.Env, assignment)
 			}
 		}
 		for _, key := range keys {
-			cmd.Env = append(cmd.Env, key+"="+environment[key])
+			cmd.Env = append(cmd.Env, key+"="+launch.Env[key])
 		}
 	}
 	stdin, err := cmd.StdinPipe()
@@ -113,7 +144,7 @@ func SpawnWithEnvironment(
 	}
 	cmd.Stderr = &logWriter{logger: logger}
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("spawn agent %q: %w", name, err)
+		return nil, fmt.Errorf("spawn agent %q: %w", launch.Command, err)
 	}
 	lifecycle := newConnectionLifecycle()
 	go func() {

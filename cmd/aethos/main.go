@@ -455,9 +455,7 @@ func agentConnector(logger *slog.Logger, catalog *agentcatalog.Catalog) session.
 		if err != nil {
 			return nil, err
 		}
-		return agent.SpawnWithEnvironment(
-			ctx, logger, handlers, installed.Env, installed.Command, installed.Args...,
-		)
+		return agent.SpawnLaunch(ctx, logger, handlers, installed.Launch)
 	}
 }
 
