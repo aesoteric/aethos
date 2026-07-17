@@ -1,0 +1,66 @@
+version: 2
+
+project_name: aethos
+
+builds:
+  - id: aethos
+    main: ./cmd/aethos
+    binary: aethos
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X main.version={{ .Version }}
+      - -X main.commit={{ .ShortCommit }}
+      - -X main.buildDate={{ .Date }}
+
+archives:
+  - ids:
+      - aethos
+    formats:
+      - tar.gz
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+dockers_v2:
+  - id: aethos
+    ids:
+      - aethos
+    dockerfile: Dockerfile
+    extra_files:
+      - deploy/docker/data
+    images:
+      - ghcr.io/aesoteric/aethos
+    tags:
+      - "{{ .Version }}"
+      - '{{ if and (not .IsSnapshot) (eq .Prerelease "") }}latest{{ end }}'
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    labels:
+      org.opencontainers.image.title: aethos
+      org.opencontainers.image.description: Self-hosted bridge from ACP Agents to messaging platforms
+      org.opencontainers.image.source: https://github.com/aesoteric/aethos
+      org.opencontainers.image.version: "{{ .Version }}"
+      org.opencontainers.image.revision: "{{ .FullCommit }}"
+    sbom: false
+
+release:
+  github:
+    owner: aesoteric
+    name: aethos

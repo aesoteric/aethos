@@ -4,13 +4,74 @@ A self-hosted bridge that connects AI coding agents — Claude Code, Codex, Gemi
 
 [![CI](https://github.com/aesoteric/aethos/actions/workflows/ci.yml/badge.svg)](https://github.com/aesoteric/aethos/actions/workflows/ci.yml)
 
-> **Status: early development.** No release yet — the walking skeleton (one Prompt through a real agent) has just landed. The [v1 spec](https://github.com/aesoteric/aethos/issues/1) tracks what's coming.
+> **Current release: v0.1.0.** Release archives are available for Linux and
+> macOS on amd64 and arm64, together with a multi-architecture distroless image.
+> The [v1 spec](https://github.com/aesoteric/aethos/issues/1) tracks what comes next.
 
 ## Why
 
 Coding agents are locked to terminal REPLs and IDE integrations. aethos lets you drive them from your phone or from automation: create a Session, watch output stream in, approve or deny risky actions — while the operational surface stays boring: download one binary, run it under systemd or Docker, back up one directory.
 
-## What v1 will include
+## Quickstart: first Telegram Session
+
+Before starting, create a Telegram bot with BotFather and a private supergroup
+with Topics enabled. Add the bot as an administrator allowed to manage Topics.
+You also need your negative group ID and the positive numeric Telegram user IDs
+that may use aethos.
+
+Download the archive for the current machine and verify its checksum:
+
+```sh
+version=0.1.0
+os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+case "$(uname -m)" in
+  x86_64|amd64) arch=amd64 ;;
+  arm64|aarch64) arch=arm64 ;;
+  *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+esac
+archive="aethos_${version}_${os}_${arch}.tar.gz"
+base_url="https://github.com/aesoteric/aethos/releases/download/v${version}"
+curl -fLO "${base_url}/${archive}"
+curl -fLO "${base_url}/checksums.txt"
+if command -v sha256sum >/dev/null 2>&1; then
+  grep " ${archive}$" checksums.txt | sha256sum -c -
+else
+  grep " ${archive}$" checksums.txt | shasum -a 256 -c -
+fi
+tar -xzf "$archive"
+./aethos version
+sudo install -m 0755 aethos /usr/local/bin/aethos
+```
+
+List the ACP registry, choose an Agent whose runtime is installed on the host,
+and install it. `codex-acp` is an `npx` example and therefore requires Node.js:
+
+```sh
+aethos agents
+aethos agents install codex-acp
+```
+
+Authenticate the chosen Agent according to its own documentation, then start
+aethos:
+
+```sh
+aethos
+```
+
+The first-run wizard validates the Telegram bot token and asks for the forum
+group, allowlisted users, Workspace, default Agent, and REST bearer token. At
+the end it writes `~/.aethos/config.toml` and starts the Telegram Channel.
+
+In Telegram, open the Assistant Topic and send `/new`. Aethos creates a Session
+Topic; open it and send the first Prompt. The Agent's streamed output and any
+permission buttons appear in that Topic.
+
+For Docker, systemd, upgrades, and backup paths, see
+[Deployment](docs/deployment.md). Release operators use the
+[release smoke checklist](docs/release-smoke.md) with real Telegram and Agent
+credentials before accepting a release.
+
+## What v0.1.0 includes
 
 - **Telegram**: each Session lives in its own forum Topic; agent output (thinking, tool calls, text) streams in as it happens; risky actions pause on approve/deny buttons.
 - **REST/SSE**: automation clients create Sessions, send Prompts, and stream events with a bearer token.

@@ -173,6 +173,25 @@ func TestRunRejectsBadInvocationsWithUsage(t *testing.T) {
 	}
 }
 
+func TestVersionCommandReportsReleaseIdentity(t *testing.T) {
+	previousVersion, previousCommit, previousBuildDate := version, commit, buildDate
+	version, commit, buildDate = "0.1.0", "abc1234", "2026-07-17T10:30:00Z"
+	t.Cleanup(func() {
+		version, commit, buildDate = previousVersion, previousCommit, previousBuildDate
+	})
+
+	var stdout strings.Builder
+	if err := run(
+		t.Context(), slog.New(slog.DiscardHandler), []string{"version"},
+		strings.NewReader(""), &stdout, io.Discard, nil,
+	); err != nil {
+		t.Fatalf("run version command: %v", err)
+	}
+	if got, want := stdout.String(), "aethos 0.1.0 (commit abc1234, built 2026-07-17T10:30:00Z)\n"; got != want {
+		t.Errorf("version output = %q, want %q", got, want)
+	}
+}
+
 func TestDevPromptPersistsAndResumesSession(t *testing.T) {
 	script := agent.Script{Turns: []agent.Turn{
 		{

@@ -31,6 +31,7 @@ import (
 const usage = `aethos — self-hosted bridge from ACP coding agents to messaging platforms
 
 usage: aethos [-data-dir <directory>]
+       aethos version
        aethos agents [-data-dir <directory>]
        aethos agents install [-data-dir <directory>] <agent-id>
 
@@ -38,6 +39,14 @@ Install an Agent before first run; aethos then creates a commented config.toml
 with an interactive setup wizard. The data directory defaults to ~/.aethos and
 can also be set with AETHOS_DATA_DIR.
 `
+
+// Release builds replace these values through linker flags. Development builds
+// retain explicit identities so their output cannot be mistaken for a release.
+var (
+	version   = "dev"
+	commit    = "unknown"
+	buildDate = "unknown"
+)
 
 // errUsage signals that usage help was printed and no further error
 // output is wanted.
@@ -99,6 +108,12 @@ func runWithRegistry(
 	telegramClient *telegram.Client,
 	registry *agentcatalog.Registry,
 ) error {
+	if len(args) == 1 && args[0] == "version" {
+		if _, err := fmt.Fprintf(stdout, "aethos %s (commit %s, built %s)\n", version, commit, buildDate); err != nil {
+			return fmt.Errorf("write version: %w", err)
+		}
+		return nil
+	}
 	if len(args) >= 2 && args[0] == "dev" && args[1] == "prompt" {
 		return devPrompt(ctx, logger, args[2:], stdout, stderr)
 	}
