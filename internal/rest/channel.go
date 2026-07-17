@@ -422,7 +422,7 @@ func (c *Channel) createSession(w http.ResponseWriter, r *http.Request, sessions
 		return
 	}
 	record, err := sessions.Create(r.Context(), session.Create{
-		Agent:     input.Agent,
+		Agent:     session.AgentRef(input.Agent),
 		Workspace: input.Workspace,
 		Owner: session.Owner{
 			Channel: "rest",
@@ -495,7 +495,7 @@ func sessionJSON(record session.Record) sessionResponse {
 	return sessionResponse{
 		ID:             record.ID,
 		Name:           record.Name,
-		Agent:          record.Agent,
+		Agent:          string(record.Agent),
 		Workspace:      record.Workspace,
 		Owner:          ownerResponse{Channel: record.Owner.Channel, ID: record.Owner.ID},
 		State:          record.State,

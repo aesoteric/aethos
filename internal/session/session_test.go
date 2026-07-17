@@ -68,6 +68,58 @@ func TestSessionRecordSurvivesShutdownAsDormant(t *testing.T) {
 	}
 }
 
+func TestSessionKeepsAgentReferenceOpaqueAcrossResume(t *testing.T) {
+	want := session.AgentRef("catalog-agent")
+	script := agent.Script{Turns: []agent.Turn{{
+		WantPrompt: "resume",
+		Stop:       agent.StopEndTurn,
+	}}}
+	var connected []session.AgentRef
+	connect := func(ctx context.Context, ref session.AgentRef, handlers agent.Handlers) (*agent.Conn, error) {
+		connected = append(connected, ref)
+		return agent.ConnectScript(ctx, slog.New(slog.DiscardHandler), handlers, &script)
+	}
+	database := t.TempDir() + "/aethos.db"
+
+	first, err := session.Open(t.Context(), database, connect, &channel.Memory{})
+	if err != nil {
+		t.Fatalf("session.Open: %v", err)
+	}
+	record, err := first.Create(t.Context(), session.Create{
+		Agent:     want,
+		Workspace: t.TempDir(),
+		Owner:     session.Owner{Channel: "test", ID: "developer"},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if record.Agent != want {
+		t.Fatalf("Agent = %q, want opaque reference %q", record.Agent, want)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	second, err := session.Open(t.Context(), database, connect, &channel.Memory{})
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer second.Close()
+	if _, err := second.Prompt(t.Context(), record.ID, "resume"); err != nil {
+		t.Fatalf("Prompt: %v", err)
+	}
+	got, err := second.Get(t.Context(), record.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Agent != want {
+		t.Errorf("resumed Agent = %q, want opaque reference %q", got.Agent, want)
+	}
+	if !reflect.DeepEqual(connected, []session.AgentRef{want, want}) {
+		t.Errorf("connected Agent references = %q, want create and resume references %q", connected, []session.AgentRef{want, want})
+	}
+}
+
 func TestPromptToDormantSessionResumesWithFullContext(t *testing.T) {
 	script := agent.Script{Turns: []agent.Turn{
 		{
@@ -1150,7 +1202,7 @@ func TestOpenRejectsDatabaseFromNewerAethos(t *testing.T) {
 		t.Fatalf("close fixture database: %v", err)
 	}
 
-	connect := func(ctx context.Context, command string, handlers agent.Handlers) (*agent.Conn, error) {
+	connect := func(ctx context.Context, command session.AgentRef, handlers agent.Handlers) (*agent.Conn, error) {
 		return nil, errors.New("connector must not run while opening the database")
 	}
 	_, err = session.Open(t.Context(), database, connect, &channel.Memory{})
@@ -1216,7 +1268,7 @@ func (c *permissionFailureChannel) Send(ctx context.Context, event channel.Event
 func (c *permissionFailureChannel) Snapshot() []channel.Event { return c.memory.Snapshot() }
 
 func scriptedConnector(script *agent.Script) session.Connect {
-	return func(ctx context.Context, _ string, handlers agent.Handlers) (*agent.Conn, error) {
+	return func(ctx context.Context, _ session.AgentRef, handlers agent.Handlers) (*agent.Conn, error) {
 		return agent.ConnectScript(ctx, slog.New(slog.DiscardHandler), handlers, script)
 	}
 }

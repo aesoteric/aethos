@@ -72,7 +72,7 @@ func (c *Channel) handleAssistant(ctx context.Context, message *message) error {
 		return fmt.Errorf("create Session Topic: %w", err)
 	}
 	record, err := c.sessions.Create(ctx, session.Create{
-		Agent:     agentID,
+		Agent:     session.AgentRef(agentID),
 		Workspace: workspace,
 		Owner: session.Owner{
 			Channel: "telegram",

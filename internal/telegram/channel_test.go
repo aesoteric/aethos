@@ -526,7 +526,7 @@ func newTelegramFlow(t *testing.T, fixture []byte, script *agent.Script, options
 func (f *telegramFlow) createSession(t *testing.T, agentCommand string, topicID int64) session.Record {
 	t.Helper()
 	record, err := f.manager.Create(t.Context(), session.Create{
-		Agent:     agentCommand,
+		Agent:     session.AgentRef(agentCommand),
 		Workspace: "/workspace",
 		Owner:     session.Owner{Channel: "telegram", ID: "123456789"},
 		TopicID:   topicID,
@@ -769,7 +769,7 @@ func (a *telegramFixtureAPI) hasVisibleMessage(topicID int64, text string) bool 
 }
 
 func scriptedConnector(script *agent.Script) session.Connect {
-	return func(ctx context.Context, _ string, handlers agent.Handlers) (*agent.Conn, error) {
+	return func(ctx context.Context, _ session.AgentRef, handlers agent.Handlers) (*agent.Conn, error) {
 		return agent.ConnectScript(ctx, slog.New(slog.DiscardHandler), handlers, script)
 	}
 }

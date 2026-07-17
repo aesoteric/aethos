@@ -36,9 +36,14 @@ type Owner struct {
 	ID      string
 }
 
+// AgentRef is a durable, opaque reference interpreted by the configured
+// Agent connector. Session management persists and reuses it without knowing
+// whether it names a catalog entry or another connector-specific target.
+type AgentRef string
+
 // Create contains the durable attributes of a new Session.
 type Create struct {
-	Agent     string
+	Agent     AgentRef
 	Workspace string
 	Owner     Owner
 	TopicID   int64
@@ -48,7 +53,7 @@ type Create struct {
 type Record struct {
 	ID             string
 	Name           string
-	Agent          string
+	Agent          AgentRef
 	Workspace      string
 	Owner          Owner
 	TopicID        int64
@@ -60,7 +65,7 @@ type Record struct {
 // Connect starts one configured Agent and attaches an event handler to it.
 // Production supplies a subprocess connector; flow tests supply the scripted
 // ACP Agent connector.
-type Connect func(context.Context, string, agent.Handlers) (*agent.Conn, error)
+type Connect func(context.Context, AgentRef, agent.Handlers) (*agent.Conn, error)
 
 // Option configures Session lifecycle behavior when a Manager opens.
 type Option func(*openOptions) error
@@ -936,7 +941,7 @@ func (m *Manager) load(ctx context.Context) (returnErr error) {
 }
 
 func validateCreate(create Create) error {
-	if strings.TrimSpace(create.Agent) == "" {
+	if strings.TrimSpace(string(create.Agent)) == "" {
 		return fmt.Errorf("agent is required")
 	}
 	if !filepath.IsAbs(create.Workspace) {

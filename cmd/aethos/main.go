@@ -425,7 +425,7 @@ func devPromptWithConnector(
 			return "", fmt.Errorf("resolve workspace: %w", resolveErr)
 		}
 		record, err = manager.Create(ctx, session.Create{
-			Agent:     *agentCmd,
+			Agent:     session.AgentRef(*agentCmd),
 			Workspace: ws,
 			Owner:     session.Owner{Channel: "dev", ID: "local"},
 		})
@@ -447,11 +447,11 @@ func devPromptWithConnector(
 }
 
 func agentConnector(logger *slog.Logger, catalog *agentcatalog.Catalog) session.Connect {
-	return func(ctx context.Context, id string, handlers agent.Handlers) (*agent.Conn, error) {
+	return func(ctx context.Context, ref session.AgentRef, handlers agent.Handlers) (*agent.Conn, error) {
 		if catalog == nil {
 			return nil, fmt.Errorf("Agent catalog is unavailable")
 		}
-		installed, err := catalog.Resolve(id)
+		installed, err := catalog.Resolve(string(ref))
 		if err != nil {
 			return nil, err
 		}
@@ -460,8 +460,8 @@ func agentConnector(logger *slog.Logger, catalog *agentcatalog.Catalog) session.
 }
 
 func directAgentConnector(logger *slog.Logger) session.Connect {
-	return func(ctx context.Context, command string, handlers agent.Handlers) (*agent.Conn, error) {
-		args := strings.Fields(command)
+	return func(ctx context.Context, ref session.AgentRef, handlers agent.Handlers) (*agent.Conn, error) {
+		args := strings.Fields(string(ref))
 		if len(args) == 0 {
 			return nil, fmt.Errorf("agent command is empty")
 		}

@@ -188,7 +188,7 @@ func TestDevPromptPersistsAndResumesSession(t *testing.T) {
 			Stop:        agent.StopEndTurn,
 		},
 	}}
-	connect := func(ctx context.Context, _ string, handlers agent.Handlers) (*agent.Conn, error) {
+	connect := func(ctx context.Context, _ session.AgentRef, handlers agent.Handlers) (*agent.Conn, error) {
 		return agent.ConnectScript(ctx, slog.New(slog.DiscardHandler), handlers, &script)
 	}
 	dataDir := t.TempDir()
@@ -252,7 +252,7 @@ allowed_user_ids = [123]
 	if err := os.WriteFile(configFile, []byte(contents), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
-	connect := func(context.Context, string, agent.Handlers) (*agent.Conn, error) {
+	connect := func(context.Context, session.AgentRef, agent.Handlers) (*agent.Conn, error) {
 		t.Fatal("Agent connector ran before invalid idle_timeout was rejected")
 		return nil, nil
 	}
@@ -307,7 +307,7 @@ allowed_user_ids = [123]
 		Events: []agent.Event{agent.Message{Text: "read complete"}},
 		Stop:   agent.StopEndTurn,
 	}}}
-	connect := func(ctx context.Context, _ string, handlers agent.Handlers) (*agent.Conn, error) {
+	connect := func(ctx context.Context, _ session.AgentRef, handlers agent.Handlers) (*agent.Conn, error) {
 		return agent.ConnectScript(ctx, slog.New(slog.DiscardHandler), handlers, &script)
 	}
 

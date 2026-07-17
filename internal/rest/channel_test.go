@@ -679,7 +679,7 @@ func TestInternalFailuresReturn500JSON(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open REST Channel: %v", err)
 	}
-	connect := func(context.Context, string, agent.Handlers) (*agent.Conn, error) {
+	connect := func(context.Context, session.AgentRef, agent.Handlers) (*agent.Conn, error) {
 		return nil, errors.New("Agent is unavailable")
 	}
 	manager, err := session.Open(t.Context(), t.TempDir()+"/aethos.db", connect, api)
@@ -807,7 +807,7 @@ func openRESTFlow(t *testing.T, script *agent.Script) (*rest.Channel, *session.M
 	if err != nil {
 		t.Fatalf("open REST Channel: %v", err)
 	}
-	connect := func(ctx context.Context, _ string, handlers agent.Handlers) (*agent.Conn, error) {
+	connect := func(ctx context.Context, _ session.AgentRef, handlers agent.Handlers) (*agent.Conn, error) {
 		return agent.ConnectScript(ctx, slog.New(slog.DiscardHandler), handlers, script)
 	}
 	var manager *session.Manager
