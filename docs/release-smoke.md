@@ -8,12 +8,14 @@ commit, hosts, and Agent below so another operator can reproduce the result.
 
 - Release tag: `v0.1.0`
 - Commit from `aethos version`: `a4b6c34`
-- Date and tester: 2026-07-17, Codex automated publication smoke
+- Date and tester: 2026-07-17, Liam manual smoke and Codex automated
+  publication smoke
 - Binary host and architecture: macOS 26.5.2, arm64
-- Docker host and architecture: Docker Desktop, Linux arm64
-- systemd host and distribution: pending real-host smoke
-- ACP Agent ID and version: `opencode` 1.18.3 (installation and execution verified)
-- Telegram bot and forum group (non-secret identifiers only): pending real-session smoke
+- Docker host and architecture: Docker Desktop on macOS 26.5.2, Linux arm64
+- systemd host and distribution: Parallels VM, Ubuntu 24.04.3 LTS, arm64
+- ACP Agent ID and version: `opencode` 1.18.3
+- Telegram bot and forum group (non-secret identifiers only): `@aesoteric_bot`,
+  `-1004460169089`
 
 ## Published artifacts
 
@@ -28,46 +30,60 @@ commit, hosts, and Agent below so another operator can reproduce the result.
 
 ## Real Telegram and Agent
 
-- [ ] Create a fresh data directory, install the recorded Agent, and complete
+The Agent must be configured to emit ACP permission requests. OpenCode permits
+tools by default, so its smoke Workspace used this `opencode.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "permission": {
+    "edit": "ask"
+  }
+}
+```
+
+- [x] Create a fresh data directory, install the recorded Agent, and complete
       the wizard with a real bot token, forum supergroup, allowlisted user, and
       Workspace.
-- [ ] Confirm the Assistant Topic appears and posts startup status.
-- [ ] Send `/new` in Assistant, then send a first Prompt in the new Topic.
-- [ ] Confirm the real Agent starts, the Session receives streamed output, and
+- [x] Confirm the Assistant Topic appears and posts startup status.
+- [x] Send `/new` in Assistant, then send a first Prompt in the new Topic.
+- [x] Confirm the real Agent starts, the Session receives streamed output, and
       the Prompt finishes without protocol errors.
-- [ ] Trigger a tool permission, approve or deny it in Telegram, and confirm the
+- [x] Trigger a tool permission, approve or deny it in Telegram, and confirm the
       Agent receives that choice.
-- [ ] Restart aethos, send another Prompt in the same Topic, and confirm the
+- [x] Restart aethos, send another Prompt in the same Topic, and confirm the
       dormant Session resumes its Agent context.
 
 ## One-volume Docker deployment
 
-- [ ] Follow the Docker commands in [deployment.md](deployment.md) from a clean
+- [x] Follow the Docker commands in [deployment.md](deployment.md) from a clean
       host directory, using exactly one bind mount at `/data`.
-- [ ] Complete the wizard and first Session using the published image, not a
+- [x] Complete the wizard and first Session using the published image, not a
       locally built image.
-- [ ] Recreate the container with the same mount; confirm configuration, Agent
+- [x] Recreate the container with the same mount; confirm configuration, Agent
       authentication, Workspace files, and Session history remain available.
-- [ ] Confirm the container process is nonroot and no second writable mount is
+- [x] Confirm the container process is nonroot and no second writable mount is
       needed.
 
 ## Real systemd host
 
-- [ ] Follow the systemd commands in [deployment.md](deployment.md) on the
+- [x] Follow the systemd commands in [deployment.md](deployment.md) on the
       recorded host using the downloaded release binary.
-- [ ] `systemd-analyze verify /etc/systemd/system/aethos.service` succeeds.
-- [ ] `systemctl enable --now aethos` reaches `active (running)` and logs appear
+- [x] `systemd-analyze verify /etc/systemd/system/aethos.service` succeeds.
+- [x] `systemctl enable --now aethos` reaches `active (running)` and logs appear
       in `journalctl -u aethos`.
-- [ ] Create and use a real Telegram Session while the service owns the process.
-- [ ] `systemctl restart aethos` succeeds and the same Session resumes.
-- [ ] Stop the service and confirm no aethos or Agent subprocess remains.
+- [x] Create and use a real Telegram Session while the service owns the process.
+- [x] `systemctl restart aethos` succeeds and the same Session resumes.
+- [x] Stop the service and confirm no aethos or Agent subprocess remains.
 
 ## Release result
 
 - [x] GitHub Actions [release run](https://github.com/aesoteric/aethos/actions/runs/29585298144)
       and [GitHub Release](https://github.com/aesoteric/aethos/releases/tag/v0.1.0).
-- [x] Automated artifact checks passed. The published image installed and ran
-      `opencode` 1.18.3 from a clean, single bind mount and retained it across
-      container recreation. The real Telegram Session, full one-volume wizard
-      and Session recreation, and real systemd-host checks remain pending.
-- [ ] Mark the release accepted only after every box above is checked.
+- [x] Automated and manual checks passed. OpenCode permits tools by default, so
+      the smoke Workspace used `permission.edit = "ask"` in `opencode.json` to
+      exercise Telegram approval. The distroless image has no shell as
+      documented, so file operations used OpenCode's `write` and `read` tools.
+      `systemd-analyze` emitted only an unrelated Parallels Tools warning about
+      its legacy `/var/run` PID path.
+- [x] Mark the release accepted only after every box above is checked.
