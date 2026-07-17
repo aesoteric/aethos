@@ -118,7 +118,7 @@ func verifyCGODisabled(path string) error {
 		}
 		return nil
 	}
-	return fmt.Errorf("Go build information has no CGO_ENABLED setting")
+	return fmt.Errorf("build information has no CGO_ENABLED setting")
 }
 
 func readChecksums(path string) (map[string]string, error) {
