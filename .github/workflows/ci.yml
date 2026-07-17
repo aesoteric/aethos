@@ -77,21 +77,18 @@ jobs:
           test -n "$image"
           container_data="${RUNNER_TEMP}/aethos-container"
           mkdir -p "$container_data/aethos" "$container_data/home" "$container_data/workspace"
-          output="$(docker run --rm \
-            --user "$(id -u):$(id -g)" \
-            --mount "type=bind,src=$container_data,dst=/data" \
-            "$image" version)"
+          docker_args=(
+            --rm
+            --user "$(id -u):$(id -g)"
+            --mount "type=bind,src=$container_data,dst=/data"
+          )
+          output="$(docker run "${docker_args[@]}" "$image" version)"
           grep -Eq '^aethos [^ ]+ \(commit [^,]+, built [^)]+\)$' <<<"$output"
           ! grep -Fq 'aethos dev ' <<<"$output"
-          docker run --rm \
-            --user "$(id -u):$(id -g)" \
-            --mount "type=bind,src=$container_data,dst=/data" \
-            "$image" agents install opencode
+          docker run "${docker_args[@]}" "$image" agents install opencode
           test -s "$container_data/aethos/agents.json"
           test -x "$container_data/aethos/agents/opencode/opencode"
-          docker run --rm \
-            --user "$(id -u):$(id -g)" \
-            --mount "type=bind,src=$container_data,dst=/data" \
+          docker run "${docker_args[@]}" \
             --entrypoint /data/aethos/agents/opencode/opencode \
             "$image" --version
       - name: Verify systemd unit
