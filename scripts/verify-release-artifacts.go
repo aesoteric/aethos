@@ -167,7 +167,12 @@ func verifyArchive(path string) error {
 		_ = file.Close()
 		return fmt.Errorf("open gzip archive %s: %w", filepath.Base(path), err)
 	}
-	found := map[string]bool{"aethos": false, "LICENSE": false, "README.md": false}
+	found := map[string]bool{
+		"aethos":                        false,
+		"LICENSE":                       false,
+		"README.md":                     false,
+		"deploy/systemd/aethos.service": false,
+	}
 	reader := tar.NewReader(gzipReader)
 	for {
 		header, readErr := reader.Next()
