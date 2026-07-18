@@ -190,12 +190,12 @@ func runWithRegistry(
 
 	routes := make(map[string]channeltypes.Channel)
 	runners := make([]channelRunner, 0, 2)
-	var bridge *telegram.Channel
+	var telegramChannel *telegram.Channel
 	if configured.Telegram != nil {
 		if telegramClient == nil {
 			return fmt.Errorf("start Telegram Channel: client is unavailable")
 		}
-		bridge, err = telegram.Open(
+		telegramChannel, err = telegram.Open(
 			ctx,
 			paths.DatabaseFile,
 			telegramClient,
@@ -212,9 +212,9 @@ func runWithRegistry(
 		if err != nil {
 			return err
 		}
-		routes["telegram"] = bridge
+		routes["telegram"] = telegramChannel
 		runners = append(runners, func(runCtx context.Context, manager *session.Manager) error {
-			return bridge.Run(runCtx, manager)
+			return telegramChannel.Run(runCtx, manager)
 		})
 	}
 	if configured.REST != nil {
@@ -225,7 +225,7 @@ func runWithRegistry(
 			Agents:        catalog,
 		}, logger)
 		if restErr != nil {
-			return errors.Join(restErr, closeTelegram(bridge))
+			return errors.Join(restErr, closeTelegram(telegramChannel))
 		}
 		routes["rest"] = api
 		runners = append(runners, func(runCtx context.Context, manager *session.Manager) error {
@@ -247,7 +247,7 @@ func runWithRegistry(
 		routes,
 	)
 	if err != nil {
-		return errors.Join(err, closeTelegram(bridge))
+		return errors.Join(err, closeTelegram(telegramChannel))
 	}
 	manager, err = session.Open(
 		ctx,
@@ -259,10 +259,10 @@ func runWithRegistry(
 		session.WithAutoApprove(configured.Permissions.AutoApprove...),
 	)
 	if err != nil {
-		return errors.Join(err, closeTelegram(bridge))
+		return errors.Join(err, closeTelegram(telegramChannel))
 	}
 	runErr := runChannels(ctx, manager, runners...)
-	return errors.Join(runErr, manager.Close(), closeTelegram(bridge))
+	return errors.Join(runErr, manager.Close(), closeTelegram(telegramChannel))
 }
 
 func agentsCommand(
@@ -383,11 +383,11 @@ func runChannels(ctx context.Context, manager *session.Manager, runners ...chann
 	return errors.Join(errs...)
 }
 
-func closeTelegram(bridge *telegram.Channel) error {
-	if bridge == nil {
+func closeTelegram(telegramChannel *telegram.Channel) error {
+	if telegramChannel == nil {
 		return nil
 	}
-	return bridge.Close()
+	return telegramChannel.Close()
 }
 
 // devPrompt is the hidden tracer-bullet command: spawn a locally
