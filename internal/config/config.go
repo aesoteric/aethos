@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/BurntSushi/toml"
 	"github.com/aesoteric/aethos/internal/permission"
@@ -181,6 +182,7 @@ func Load(path string) (Config, error) {
 	}
 
 	applyEnvironment(&cfg)
+	normalizeSlack(cfg.Slack)
 	if err := cfg.Validate(); err != nil {
 		return Config{}, fmt.Errorf("invalid config %q: %w", path, err)
 	}
@@ -244,14 +246,14 @@ func (c Config) Validate() error {
 		}
 	}
 	if c.Slack != nil {
-		if !strings.HasPrefix(strings.TrimSpace(c.Slack.AppToken), "xapp-") {
+		if !validSlackToken(c.Slack.AppToken, "xapp-") {
 			return fmt.Errorf("slack.app_token is required and must start with xapp- (set it in config.toml or %s)", slackAppTokenEnv)
 		}
-		if !strings.HasPrefix(strings.TrimSpace(c.Slack.BotToken), "xoxb-") {
+		if !validSlackToken(c.Slack.BotToken, "xoxb-") {
 			return fmt.Errorf("slack.bot_token is required and must start with xoxb- (set it in config.toml or %s)", slackBotTokenEnv)
 		}
-		if strings.TrimSpace(c.Slack.ChannelID) == "" {
-			return fmt.Errorf("slack.channel_id is required")
+		if !validSlackChannelID(c.Slack.ChannelID) {
+			return fmt.Errorf("slack.channel_id is required and must be a Slack channel ID beginning with C or G")
 		}
 		if err := validateSlackAllowedUserIDs(c.Slack.AllowedUserIDs); err != nil {
 			return err
@@ -282,6 +284,30 @@ func (c Config) Validate() error {
 		seenKinds[kind] = struct{}{}
 	}
 	return nil
+}
+
+func normalizeSlack(slack *Slack) {
+	if slack == nil {
+		return
+	}
+	slack.AppToken = strings.TrimSpace(slack.AppToken)
+	slack.BotToken = strings.TrimSpace(slack.BotToken)
+	slack.ChannelID = strings.TrimSpace(slack.ChannelID)
+	for index := range slack.AllowedUserIDs {
+		slack.AllowedUserIDs[index] = strings.TrimSpace(slack.AllowedUserIDs[index])
+	}
+}
+
+func validSlackToken(token, prefix string) bool {
+	return len(token) > len(prefix) &&
+		strings.HasPrefix(token, prefix) &&
+		!strings.ContainsFunc(token, unicode.IsSpace)
+}
+
+func validSlackChannelID(channelID string) bool {
+	return len(channelID) > 1 &&
+		(channelID[0] == 'C' || channelID[0] == 'G') &&
+		!strings.ContainsFunc(channelID, unicode.IsSpace)
 }
 
 func validateSlackAllowedUserIDs(userIDs []string) error {

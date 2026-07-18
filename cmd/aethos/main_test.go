@@ -390,21 +390,7 @@ func TestRunFirstRunWritesConfigAndRunsTelegramChannelAcrossRestart(t *testing.T
 	t.Cleanup(server.Close)
 
 	dataDir := filepath.Join(t.TempDir(), "data")
-	installedCatalog, err := agentcatalog.Open(filepath.Join(dataDir, "agents.json"), filepath.Join(dataDir, "agents"))
-	if err != nil {
-		t.Fatalf("open Agent catalog: %v", err)
-	}
-	_, err = installedCatalog.Install(t.Context(), agentcatalog.RegistryAgent{
-		ID:      "codex-acp",
-		Name:    "Codex",
-		Version: "1.1.4",
-		Distribution: agentcatalog.Distribution{NPX: &agentcatalog.PackageDistribution{
-			Package: "@agentclientprotocol/codex-acp@1.1.4",
-		}},
-	}, nil)
-	if err != nil {
-		t.Fatalf("install Agent catalog fixture: %v", err)
-	}
+	installCatalogAgent(t, dataDir)
 	workspace := t.TempDir()
 	input := strings.NewReader("valid-token\n-1001234567890\n123456789\n" + workspace + "\ncodex-acp\n")
 	var firstOutput strings.Builder
@@ -526,21 +512,7 @@ default_agent = "codex-acp"
 
 func TestRunStartsWithOnlySlackConfigured(t *testing.T) {
 	dataDir := t.TempDir()
-	catalog, err := agentcatalog.Open(filepath.Join(dataDir, "agents.json"), filepath.Join(dataDir, "agents"))
-	if err != nil {
-		t.Fatalf("open Agent catalog: %v", err)
-	}
-	_, err = catalog.Install(t.Context(), agentcatalog.RegistryAgent{
-		ID:      "codex-acp",
-		Name:    "Codex",
-		Version: "1.1.4",
-		Distribution: agentcatalog.Distribution{NPX: &agentcatalog.PackageDistribution{
-			Package: "@agentclientprotocol/codex-acp@1.1.4",
-		}},
-	}, nil)
-	if err != nil {
-		t.Fatalf("install Agent catalog fixture: %v", err)
-	}
+	installCatalogAgent(t, dataDir)
 	configFile := filepath.Join(dataDir, "config.toml")
 	contents := `workspace = "/workspace"
 default_agent = "codex-acp"
@@ -555,34 +527,28 @@ allowed_user_ids = ["U0123456789"]
 		t.Fatalf("write config: %v", err)
 	}
 	ctx, cancel := context.WithCancel(t.Context())
-	cancel()
 
-	err = run(
-		ctx, slog.New(slog.DiscardHandler), []string{"-data-dir", dataDir},
-		strings.NewReader(""), io.Discard, io.Discard, nil,
-	)
-	if err != nil {
+	done := make(chan error, 1)
+	go func() {
+		done <- run(
+			ctx, slog.New(slog.DiscardHandler), []string{"-data-dir", dataDir},
+			strings.NewReader(""), io.Discard, io.Discard, nil,
+		)
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("Slack-only startup returned before cancellation: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	cancel()
+	if err := <-done; err != nil {
 		t.Fatalf("run Slack-only config: %v", err)
 	}
 }
 
 func TestRunStartsOnlyConfiguredRESTChannel(t *testing.T) {
 	dataDir := t.TempDir()
-	catalog, err := agentcatalog.Open(filepath.Join(dataDir, "agents.json"), filepath.Join(dataDir, "agents"))
-	if err != nil {
-		t.Fatalf("open Agent catalog: %v", err)
-	}
-	_, err = catalog.Install(t.Context(), agentcatalog.RegistryAgent{
-		ID:      "codex-acp",
-		Name:    "Codex",
-		Version: "1.1.4",
-		Distribution: agentcatalog.Distribution{NPX: &agentcatalog.PackageDistribution{
-			Package: "@agentclientprotocol/codex-acp@1.1.4",
-		}},
-	}, nil)
-	if err != nil {
-		t.Fatalf("install Agent catalog fixture: %v", err)
-	}
+	installCatalogAgent(t, dataDir)
 	configFile := filepath.Join(dataDir, "config.toml")
 	contents := `workspace = "/workspace"
 default_agent = "codex-acp"
@@ -646,21 +612,7 @@ func TestRunStartsOnlyConfiguredTelegramChannel(t *testing.T) {
 	t.Cleanup(server.Close)
 
 	dataDir := t.TempDir()
-	catalog, err := agentcatalog.Open(filepath.Join(dataDir, "agents.json"), filepath.Join(dataDir, "agents"))
-	if err != nil {
-		t.Fatalf("open Agent catalog: %v", err)
-	}
-	_, err = catalog.Install(t.Context(), agentcatalog.RegistryAgent{
-		ID:      "codex-acp",
-		Name:    "Codex",
-		Version: "1.1.4",
-		Distribution: agentcatalog.Distribution{NPX: &agentcatalog.PackageDistribution{
-			Package: "@agentclientprotocol/codex-acp@1.1.4",
-		}},
-	}, nil)
-	if err != nil {
-		t.Fatalf("install Agent catalog fixture: %v", err)
-	}
+	installCatalogAgent(t, dataDir)
 	configFile := filepath.Join(dataDir, "config.toml")
 	contents := `workspace = "/workspace"
 default_agent = "codex-acp"
@@ -712,6 +664,25 @@ func (b *synchronizedBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.contents.String()
+}
+
+func installCatalogAgent(t *testing.T, dataDir string) {
+	t.Helper()
+	catalog, err := agentcatalog.Open(filepath.Join(dataDir, "agents.json"), filepath.Join(dataDir, "agents"))
+	if err != nil {
+		t.Fatalf("open Agent catalog: %v", err)
+	}
+	_, err = catalog.Install(t.Context(), agentcatalog.RegistryAgent{
+		ID:      "codex-acp",
+		Name:    "Codex",
+		Version: "1.1.4",
+		Distribution: agentcatalog.Distribution{NPX: &agentcatalog.PackageDistribution{
+			Package: "@agentclientprotocol/codex-acp@1.1.4",
+		}},
+	}, nil)
+	if err != nil {
+		t.Fatalf("install Agent catalog fixture: %v", err)
+	}
 }
 
 func unsetEnv(t *testing.T, key string) {

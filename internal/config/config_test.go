@@ -225,6 +225,14 @@ allowed_user_ids = ["U0123456789"]`,
 			wantError: "must start with xapp-",
 		},
 		{
+			name: "incomplete app token",
+			slack: `app_token = "xapp-"
+bot_token = "xoxb-bot-token"
+channel_id = "C0123456789"
+allowed_user_ids = ["U0123456789"]`,
+			wantError: "slack.app_token",
+		},
+		{
 			name: "missing bot token",
 			slack: `app_token = "xapp-app-token"
 channel_id = "C0123456789"
@@ -245,6 +253,14 @@ allowed_user_ids = ["U0123456789"]`,
 bot_token = "xoxb-bot-token"
 allowed_user_ids = ["U0123456789"]`,
 			wantError: "slack.channel_id",
+		},
+		{
+			name: "invalid channel ID",
+			slack: `app_token = "xapp-app-token"
+bot_token = "xoxb-bot-token"
+channel_id = "not-a-channel-id"
+allowed_user_ids = ["U0123456789"]`,
+			wantError: "Slack channel ID",
 		},
 		{
 			name: "empty allowed user IDs",
@@ -270,6 +286,14 @@ channel_id = "C0123456789"
 allowed_user_ids = ["U0123456789", "U0123456789"]`,
 			wantError: "duplicate Slack user ID",
 		},
+		{
+			name: "duplicate normalized allowed user ID",
+			slack: `app_token = "xapp-app-token"
+bot_token = "xoxb-bot-token"
+channel_id = "C0123456789"
+allowed_user_ids = ["U0123456789", " U0123456789 "]`,
+			wantError: "duplicate Slack user ID",
+		},
 	}
 
 	for _, tt := range tests {
@@ -290,8 +314,8 @@ default_agent = "codex-acp"
 }
 
 func TestLoadAppliesSlackTokenEnvironmentOverrides(t *testing.T) {
-	t.Setenv("AETHOS_SLACK_APP_TOKEN", "xapp-environment-token")
-	t.Setenv("AETHOS_SLACK_BOT_TOKEN", "xoxb-environment-token")
+	t.Setenv("AETHOS_SLACK_APP_TOKEN", " xapp-environment-token ")
+	t.Setenv("AETHOS_SLACK_BOT_TOKEN", " xoxb-environment-token ")
 	path := filepath.Join(t.TempDir(), "config.toml")
 	writeFixture(t, path, `workspace = "/workspace"
 default_agent = "codex-acp"
@@ -312,6 +336,30 @@ allowed_user_ids = ["U0123456789"]
 	}
 	if got.Slack.BotToken != "xoxb-environment-token" {
 		t.Errorf("Slack.BotToken = %q, want environment override", got.Slack.BotToken)
+	}
+}
+
+func TestLoadNormalizesSlackChannelAndAllowedUserIDs(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	writeFixture(t, path, `workspace = "/workspace"
+default_agent = "codex-acp"
+
+[slack]
+app_token = "xapp-app-token"
+bot_token = "xoxb-bot-token"
+channel_id = " C0123456789 "
+allowed_user_ids = [" U0123456789 ", "W0123456789"]
+`)
+
+	got, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.Slack.ChannelID != "C0123456789" {
+		t.Errorf("Slack.ChannelID = %q, want normalized ID", got.Slack.ChannelID)
+	}
+	if want := []string{"U0123456789", "W0123456789"}; !slices.Equal(got.Slack.AllowedUserIDs, want) {
+		t.Errorf("Slack.AllowedUserIDs = %q, want %q", got.Slack.AllowedUserIDs, want)
 	}
 }
 

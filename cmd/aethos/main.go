@@ -233,6 +233,8 @@ func runWithRegistry(
 		})
 	}
 	if len(runners) == 0 {
+		// The Slack runtime arrives in issue #19. Until then, a valid Slack-only
+		// deployment remains live without constructing an unconfigured Channel.
 		<-ctx.Done()
 		return nil
 	}
