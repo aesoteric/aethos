@@ -21,7 +21,9 @@ import (
 	"github.com/aesoteric/aethos/internal/agentcatalog"
 	"github.com/aesoteric/aethos/internal/channel"
 	"github.com/aesoteric/aethos/internal/session"
+	"github.com/aesoteric/aethos/internal/slack"
 	"github.com/aesoteric/aethos/internal/telegram"
+	"github.com/coder/websocket"
 )
 
 func TestAgentsCommandListsAndInstallsRegistryAgent(t *testing.T) {
@@ -511,6 +513,32 @@ default_agent = "codex-acp"
 }
 
 func TestRunStartsWithOnlySlackConfigured(t *testing.T) {
+	connected := make(chan struct{}, 1)
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/auth.test":
+			fmt.Fprint(w, `{"ok":true,"team_id":"T0123456789","user_id":"U0AETHOS000","bot_id":"B0AETHOS000"}`)
+		case "/api/apps.connections.open":
+			fmt.Fprintf(w, `{"ok":true,"url":%q}`, strings.Replace(server.URL, "http://", "ws://", 1)+"/socket")
+		case "/socket":
+			connection, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer connection.CloseNow()
+			select {
+			case connected <- struct{}{}:
+			default:
+			}
+			_, _, _ = connection.Read(r.Context())
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+
 	dataDir := t.TempDir()
 	installCatalogAgent(t, dataDir)
 	configFile := filepath.Join(dataDir, "config.toml")
@@ -529,16 +557,19 @@ allowed_user_ids = ["U0123456789"]
 	ctx, cancel := context.WithCancel(t.Context())
 
 	done := make(chan error, 1)
+	slackClient := slack.NewClient(server.URL+"/api", server.Client())
 	go func() {
-		done <- run(
+		done <- runWithClients(
 			ctx, slog.New(slog.DiscardHandler), []string{"-data-dir", dataDir},
-			strings.NewReader(""), io.Discard, io.Discard, nil,
+			strings.NewReader(""), io.Discard, io.Discard, nil, slackClient,
 		)
 	}()
 	select {
+	case <-connected:
 	case err := <-done:
 		t.Fatalf("Slack-only startup returned before cancellation: %v", err)
-	case <-time.After(25 * time.Millisecond):
+	case <-time.After(2 * time.Second):
+		t.Fatal("Slack-only startup did not connect to Socket Mode")
 	}
 	cancel()
 	if err := <-done; err != nil {

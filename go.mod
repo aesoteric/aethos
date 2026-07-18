@@ -5,6 +5,7 @@ go 1.24.0
 require (
 	github.com/BurntSushi/toml v1.6.0
 	github.com/coder/acp-go-sdk v0.13.5
+	github.com/coder/websocket v1.8.15
 	modernc.org/sqlite v1.45.0
 )
 

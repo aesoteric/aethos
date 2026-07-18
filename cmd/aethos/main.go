@@ -24,6 +24,7 @@ import (
 	"github.com/aesoteric/aethos/internal/config"
 	"github.com/aesoteric/aethos/internal/rest"
 	"github.com/aesoteric/aethos/internal/session"
+	"github.com/aesoteric/aethos/internal/slack"
 	"github.com/aesoteric/aethos/internal/telegram"
 )
 
@@ -93,8 +94,25 @@ func run(
 	telegramClient *telegram.Client,
 ) error {
 	registryClient := &http.Client{Timeout: 30 * time.Second}
-	return runWithRegistry(
-		ctx, logger, args, stdin, stdout, stderr, telegramClient,
+	slackClient := slack.NewClient(slack.APIBaseURL, &http.Client{Timeout: 15 * time.Second})
+	return runApplication(
+		ctx, logger, args, stdin, stdout, stderr, telegramClient, slackClient,
+		agentcatalog.NewRegistry("", registryClient),
+	)
+}
+
+func runWithClients(
+	ctx context.Context,
+	logger *slog.Logger,
+	args []string,
+	stdin io.Reader,
+	stdout, stderr io.Writer,
+	telegramClient *telegram.Client,
+	slackClient *slack.Client,
+) error {
+	registryClient := &http.Client{Timeout: 30 * time.Second}
+	return runApplication(
+		ctx, logger, args, stdin, stdout, stderr, telegramClient, slackClient,
 		agentcatalog.NewRegistry("", registryClient),
 	)
 }
@@ -106,6 +124,23 @@ func runWithRegistry(
 	stdin io.Reader,
 	stdout, stderr io.Writer,
 	telegramClient *telegram.Client,
+	registry *agentcatalog.Registry,
+) error {
+	return runApplication(
+		ctx, logger, args, stdin, stdout, stderr, telegramClient,
+		slack.NewClient(slack.APIBaseURL, &http.Client{Timeout: 15 * time.Second}),
+		registry,
+	)
+}
+
+func runApplication(
+	ctx context.Context,
+	logger *slog.Logger,
+	args []string,
+	stdin io.Reader,
+	stdout, stderr io.Writer,
+	telegramClient *telegram.Client,
+	slackClient *slack.Client,
 	registry *agentcatalog.Registry,
 ) error {
 	if len(args) == 1 && args[0] == "version" {
@@ -189,7 +224,7 @@ func runWithRegistry(
 	}
 
 	routes := make(map[string]channeltypes.Channel)
-	runners := make([]channelRunner, 0, 2)
+	runners := make([]channelRunner, 0, 3)
 	var telegramChannel *telegram.Channel
 	if configured.Telegram != nil {
 		if telegramClient == nil {
@@ -217,6 +252,25 @@ func runWithRegistry(
 			return telegramChannel.Run(runCtx, manager)
 		})
 	}
+	if configured.Slack != nil {
+		if slackClient == nil {
+			return errors.Join(fmt.Errorf("start Slack Channel: client is unavailable"), closeTelegram(telegramChannel))
+		}
+		slackChannel, slackErr := slack.New(slackClient, logger, slack.Settings{
+			AppToken:       configured.Slack.AppToken,
+			BotToken:       configured.Slack.BotToken,
+			ChannelID:      configured.Slack.ChannelID,
+			AllowedUserIDs: configured.Slack.AllowedUserIDs,
+			Agents:         catalog,
+		})
+		if slackErr != nil {
+			return errors.Join(slackErr, closeTelegram(telegramChannel))
+		}
+		routes["slack"] = slackChannel
+		runners = append(runners, func(runCtx context.Context, _ *session.Manager) error {
+			return slackChannel.Run(runCtx)
+		})
+	}
 	if configured.REST != nil {
 		api, restErr := rest.New(rest.Settings{
 			ListenAddress: configured.REST.ListenAddress,
@@ -233,10 +287,7 @@ func runWithRegistry(
 		})
 	}
 	if len(runners) == 0 {
-		// The Slack runtime arrives in issue #19. Until then, a valid Slack-only
-		// deployment remains live without constructing an unconfigured Channel.
-		<-ctx.Done()
-		return nil
+		return errors.Join(fmt.Errorf("no configured Channel runtime is available"), closeTelegram(telegramChannel))
 	}
 	var manager *session.Manager
 	events, err := channeltypes.NewRouter(
