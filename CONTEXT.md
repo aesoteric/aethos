@@ -29,11 +29,11 @@ The directory an agent reads and writes for a session.
 _Avoid_: project, working directory, repo
 
 **Topic**:
-The Telegram forum thread bound to a session — the user-visible face of that session.
+The Channel-owned conversational surface durably bound to a Session — the user-visible face of that session. On Telegram a forum topic; on Slack a thread. A Topic's identity is opaque outside its owning Channel.
 _Avoid_: thread, channel
 
 **Assistant**:
-The reserved Telegram topic for meta-conversation with aethos itself (creating sessions, status). Bound to no session.
+The reserved meta-conversation surface for talking to aethos itself (creating sessions, status). Bound to no session. On Telegram a reserved topic; on Slack the configured channel's top-level conversation.
 
 **Prompt**:
 One user message dispatched to a session's agent. Queued serially per session; queued prompts do not survive a restart.
