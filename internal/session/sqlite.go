@@ -24,6 +24,11 @@ var migrations = []string{
 	`ALTER TABLE sessions ADD COLUMN name TEXT NOT NULL DEFAULT '';
 	 ALTER TABLE sessions ADD COLUMN topic_id INTEGER NOT NULL DEFAULT 0;
 	 CREATE UNIQUE INDEX sessions_topic_id ON sessions(topic_id) WHERE topic_id != 0;`,
+	`ALTER TABLE sessions ADD COLUMN topic_key TEXT NOT NULL DEFAULT '';
+	 UPDATE sessions SET topic_key = CAST(topic_id AS TEXT) WHERE topic_id != 0;
+	 DROP INDEX sessions_topic_id;
+	 ALTER TABLE sessions DROP COLUMN topic_id;
+	 CREATE UNIQUE INDEX sessions_topic_key ON sessions(owner_channel, topic_key) WHERE topic_key != '';`,
 }
 
 func openDatabase(ctx context.Context, path string) (*sql.DB, error) {
@@ -80,7 +85,7 @@ func insertRecord(ctx context.Context, db *sql.DB, record Record, agentSessionID
 	_, err := db.ExecContext(ctx, `
 		INSERT INTO sessions (
 			id, name, agent_session_id, agent, workspace, owner_channel, owner_id,
-			topic_id, state, created_at, last_activity_at
+			topic_key, state, created_at, last_activity_at
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		record.ID,
 		record.Name,
@@ -89,7 +94,7 @@ func insertRecord(ctx context.Context, db *sql.DB, record Record, agentSessionID
 		record.Workspace,
 		record.Owner.Channel,
 		record.Owner.ID,
-		record.TopicID,
+		record.TopicKey,
 		record.State,
 		record.CreatedAt.UnixNano(),
 		record.LastActivityAt.UnixNano(),

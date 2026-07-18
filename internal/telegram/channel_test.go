@@ -121,8 +121,8 @@ func TestTelegramChannelDrivesSessionFlowThroughFixtureUpdates(t *testing.T) {
 	if record.Agent != "chosen-agent" || record.Workspace != chosenWorkspace {
 		t.Errorf("Session selection = agent %q Workspace %q, want command choices", record.Agent, record.Workspace)
 	}
-	if record.Name != "Investigate flaky tests" || record.TopicID != 202 {
-		t.Errorf("Session name/topic = %q/%d, want first Prompt title bound to Topic 202", record.Name, record.TopicID)
+	if record.Name != "Investigate flaky tests" || record.TopicKey != "202" {
+		t.Errorf("Session name/topic = %q/%q, want first Prompt title bound to Topic 202", record.Name, record.TopicKey)
 	}
 	for _, rejectedID := range []string{"999", "998", "997"} {
 		if !strings.Contains(logs.String(), `"telegram_user_id":`+rejectedID) {
@@ -181,7 +181,7 @@ func TestTelegramChannelBatchesStreamingEventsIntoMessageEdits(t *testing.T) {
 		Agent:     "agent",
 		Workspace: "/workspace",
 		Owner:     session.Owner{Channel: "telegram", ID: "123456789"},
-		TopicID:   303,
+		TopicKey:  "303",
 	})
 	if err != nil {
 		t.Fatalf("create Session: %v", err)
@@ -252,7 +252,7 @@ func TestTelegramChannelFindsAssistantAndResumesDormantSessionAfterRestart(t *te
 	go func() { firstDone <- firstBridge.Run(firstCtx, firstManager) }()
 	waitFor(t, func() bool {
 		records, listErr := firstManager.List(t.Context())
-		return listErr == nil && len(records) == 1 && records[0].TopicID == 202
+		return listErr == nil && len(records) == 1 && records[0].TopicKey == "202"
 	})
 	firstCancel()
 	if err := <-firstDone; err != nil {
@@ -295,7 +295,7 @@ func TestTelegramChannelFindsAssistantAndResumesDormantSessionAfterRestart(t *te
 	if err != nil {
 		t.Fatalf("get resumed Session: %v", err)
 	}
-	if resumed.State != session.Live || resumed.Name != "continue after restart" || resumed.TopicID != 202 {
+	if resumed.State != session.Live || resumed.Name != "continue after restart" || resumed.TopicKey != "202" {
 		t.Errorf("resumed Session = %#v, want live named Session still bound to Topic 202", resumed)
 	}
 	if got := api.count("createForumTopic"); got != 2 {
@@ -529,7 +529,7 @@ func (f *telegramFlow) createSession(t *testing.T, agentCommand string, topicID 
 		Agent:     session.AgentRef(agentCommand),
 		Workspace: "/workspace",
 		Owner:     session.Owner{Channel: "telegram", ID: "123456789"},
-		TopicID:   topicID,
+		TopicKey:  strconv.FormatInt(topicID, 10),
 	})
 	if err != nil {
 		t.Fatalf("create Session: %v", err)

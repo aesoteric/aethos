@@ -14,14 +14,14 @@ import (
 	"github.com/aesoteric/aethos/internal/session"
 )
 
-func (c *Channel) cancelPrompt(ctx context.Context, record session.Record) error {
+func (c *Channel) cancelPrompt(ctx context.Context, record session.Record, topicID int64) error {
 	if err := c.sessions.Cancel(ctx, record.ID); err != nil {
 		if errors.Is(err, session.ErrNoPrompt) {
 			_, sendErr := c.client.sendMessage(
 				ctx,
 				c.settings.Token,
 				c.settings.ChatID,
-				record.TopicID,
+				topicID,
 				"No Prompt is currently running.",
 			)
 			return sendErr
@@ -32,7 +32,7 @@ func (c *Channel) cancelPrompt(ctx context.Context, record session.Record) error
 		ctx,
 		c.settings.Token,
 		c.settings.ChatID,
-		record.TopicID,
+		topicID,
 		"Prompt cancelled.",
 	)
 	return err
@@ -71,20 +71,19 @@ func (c *Channel) handleAssistant(ctx context.Context, message *message) error {
 	if err != nil {
 		return fmt.Errorf("create Session Topic: %w", err)
 	}
-	record, err := c.sessions.Create(ctx, session.Create{
+	if _, err := c.sessions.Create(ctx, session.Create{
 		Agent:     session.AgentRef(agentID),
 		Workspace: workspace,
 		Owner: session.Owner{
-			Channel: "telegram",
+			Channel: channelName,
 			ID:      strconv.FormatInt(message.From.ID, 10),
 		},
-		TopicID: topic.MessageThreadID,
-	})
-	if err != nil {
+		TopicKey: topicKey(topic.MessageThreadID),
+	}); err != nil {
 		cleanupErr := c.client.deleteForumTopic(ctx, c.settings.Token, c.settings.ChatID, topic.MessageThreadID)
 		return errors.Join(fmt.Errorf("create Session: %w", err), cleanupErr)
 	}
-	if _, err := c.client.sendMessage(ctx, c.settings.Token, c.settings.ChatID, record.TopicID,
+	if _, err := c.client.sendMessage(ctx, c.settings.Token, c.settings.ChatID, topic.MessageThreadID,
 		"Session ready. Send a Prompt in this Topic."); err != nil {
 		return fmt.Errorf("post Session status: %w", err)
 	}

@@ -23,10 +23,25 @@ import (
 )
 
 const (
+	channelName         = "telegram"
 	assistantTopicName  = "Assistant"
 	newSessionTopicName = "New Session"
 	telegramTextLimit   = 4000
 )
+
+// topicKey encodes a Telegram forum topic ID as this Channel's owner-scoped
+// Topic key; parseTopicKey is its inverse.
+func topicKey(topicID int64) string {
+	return strconv.FormatInt(topicID, 10)
+}
+
+func parseTopicKey(key string) (int64, bool) {
+	id, err := strconv.ParseInt(key, 10, 64)
+	if err != nil || id <= 0 {
+		return 0, false
+	}
+	return id, true
+}
 
 // Settings contains the Telegram and default Session values needed by the
 // Telegram Channel at runtime.
@@ -77,7 +92,7 @@ type sessionTarget interface {
 	Cancel(context.Context, string) error
 	ResolvePermission(context.Context, channeltypes.PermissionResponse) error
 	Get(context.Context, string) (session.Record, error)
-	FindByTopic(context.Context, int64) (session.Record, error)
+	FindByTopic(context.Context, string, string) (session.Record, error)
 	Rename(context.Context, string, string) (session.Record, error)
 	List(context.Context) ([]session.Record, error)
 	CloseSession(context.Context, string) (session.Record, error)
@@ -362,7 +377,7 @@ func (c *Channel) handleUpdate(ctx context.Context, one update) error {
 	case assistantTopicID:
 		return c.handleAssistant(ctx, message)
 	default:
-		record, err := c.sessions.FindByTopic(ctx, message.MessageThreadID)
+		record, err := c.sessions.FindByTopic(ctx, channelName, topicKey(message.MessageThreadID))
 		if errors.Is(err, sql.ErrNoRows) {
 			c.logger.Debug("ignored Telegram message in an unbound Topic", "topic_id", message.MessageThreadID)
 			return nil
@@ -372,11 +387,11 @@ func (c *Channel) handleUpdate(ctx context.Context, one update) error {
 		}
 		command, _ := telegramCommand(message.Text)
 		if command == "/cancel" {
-			return c.cancelPrompt(ctx, record)
+			return c.cancelPrompt(ctx, record, message.MessageThreadID)
 		}
 		return c.enqueuePrompt(ctx, inboundPrompt{
 			sessionID: record.ID,
-			topicID:   record.TopicID,
+			topicID:   message.MessageThreadID,
 			text:      strings.TrimSpace(message.Text),
 		})
 	}
@@ -429,22 +444,22 @@ func (c *Channel) handlePrompt(ctx context.Context, prompt inboundPrompt) {
 		name := sessionName(prompt.text)
 		renamed, err := c.sessions.Rename(ctx, record.ID, name)
 		if err != nil {
-			c.reportPromptError(ctx, record.TopicID, err)
+			c.reportPromptError(ctx, prompt.topicID, err)
 			return
 		}
 		record = renamed
-		if err := c.client.editForumTopic(ctx, c.settings.Token, c.settings.ChatID, record.TopicID, name); err != nil {
-			c.logger.Warn("rename Telegram Session Topic", "session", record.ID, "topic_id", record.TopicID, "error", err)
+		if err := c.client.editForumTopic(ctx, c.settings.Token, c.settings.ChatID, prompt.topicID, name); err != nil {
+			c.logger.Warn("rename Telegram Session Topic", "session", record.ID, "topic_id", prompt.topicID, "error", err)
 		}
 	}
-	c.beginDraft(record.ID, record.TopicID)
+	c.beginDraft(record.ID, prompt.topicID)
 	_, err = c.sessions.Prompt(ctx, record.ID, prompt.text)
 	flushErr := c.waitForDraft(ctx, record.ID)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			return
 		}
-		c.reportPromptError(ctx, record.TopicID, err)
+		c.reportPromptError(ctx, prompt.topicID, err)
 		return
 	}
 	if flushErr != nil && ctx.Err() == nil {
@@ -480,12 +495,16 @@ func (c *Channel) Send(ctx context.Context, event channeltypes.Event) error {
 	if err != nil {
 		return err
 	}
-	if record.TopicID == 0 || record.Owner.Channel != "telegram" {
+	if record.Owner.Channel != channelName {
+		return nil
+	}
+	topicID, bound := parseTopicKey(record.TopicKey)
+	if !bound {
 		return nil
 	}
 	switch permissionEvent := event.AgentEvent.(type) {
 	case agent.PermissionRequested:
-		return c.presentPermission(ctx, record.TopicID, permissionEvent)
+		return c.presentPermission(ctx, topicID, permissionEvent)
 	case agent.PermissionResolved:
 		return c.finishPermission(ctx, permissionEvent)
 	}
@@ -493,7 +512,7 @@ func (c *Channel) Send(ctx context.Context, event channeltypes.Event) error {
 	if fragment.text == "" {
 		return nil
 	}
-	c.appendDraft(record.ID, record.TopicID, fragment)
+	c.appendDraft(record.ID, topicID, fragment)
 	return nil
 }
 
