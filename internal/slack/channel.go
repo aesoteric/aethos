@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/aesoteric/aethos/internal/agentcatalog"
-	channeltypes "github.com/aesoteric/aethos/internal/channel"
 	"github.com/coder/websocket"
 )
 
@@ -257,11 +256,3 @@ func (c *Channel) sendAgentList(ctx context.Context) error {
 	_, err := c.client.PostMessage(ctx, c.settings.BotToken, c.settings.ChannelID, "", text.String())
 	return err
 }
-
-// Send implements channel.Channel. Slack cannot own Sessions during the
-// read-only Assistant milestone, so there are no Session events to render yet.
-func (c *Channel) Send(ctx context.Context, _ channeltypes.Event) error {
-	return ctx.Err()
-}
-
-var _ channeltypes.Channel = (*Channel)(nil)

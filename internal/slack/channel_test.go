@@ -144,7 +144,7 @@ func TestSocketModeReconnectsAfterSlackRefreshRequest(t *testing.T) {
 			messageEnvelope("after-refresh-envelope", "U0123456789", "C0123456789", "agents", ""),
 		}},
 	)
-	bridge := newSlackChannel(t, api)
+	bridge := newSlackChannel(t, api, slack.WithReconnectBackoff(25*time.Millisecond, 25*time.Millisecond))
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() { done <- bridge.Run(ctx) }()
@@ -156,6 +156,13 @@ func TestSocketModeReconnectsAfterSlackRefreshRequest(t *testing.T) {
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatalf("run Slack Channel: %v", err)
+	}
+	connectionOpens := api.callTimes("apps.connections.open")
+	if len(connectionOpens) < 2 {
+		t.Fatalf("apps.connections.open calls = %d, want a fresh URL after Slack's refresh request", len(connectionOpens))
+	}
+	if elapsed := connectionOpens[1].Sub(connectionOpens[0]); elapsed < 20*time.Millisecond {
+		t.Errorf("Socket Mode refreshed after %s, want the configured backoff", elapsed)
 	}
 }
 

@@ -46,9 +46,9 @@ func TestAgentsCommandListsAndInstallsRegistryAgent(t *testing.T) {
 	logger := slog.New(slog.DiscardHandler)
 
 	var listOutput strings.Builder
-	if err := runWithRegistry(
+	if err := runApplication(
 		t.Context(), logger, []string{"agents", "-data-dir", dataDir},
-		strings.NewReader(""), &listOutput, io.Discard, nil, registry,
+		strings.NewReader(""), &listOutput, io.Discard, applicationDependencies{registry: registry},
 	); err != nil {
 		t.Fatalf("list registry Agents: %v", err)
 	}
@@ -59,9 +59,9 @@ func TestAgentsCommandListsAndInstallsRegistryAgent(t *testing.T) {
 	}
 
 	var installOutput strings.Builder
-	if err := runWithRegistry(
+	if err := runApplication(
 		t.Context(), logger, []string{"agents", "install", "-data-dir", dataDir, "codex-acp"},
-		strings.NewReader(""), &installOutput, io.Discard, nil, registry,
+		strings.NewReader(""), &installOutput, io.Discard, applicationDependencies{registry: registry},
 	); err != nil {
 		t.Fatalf("install registry Agent: %v", err)
 	}
@@ -559,9 +559,9 @@ allowed_user_ids = ["U0123456789"]
 	done := make(chan error, 1)
 	slackClient := slack.NewClient(server.URL+"/api", server.Client())
 	go func() {
-		done <- runWithClients(
+		done <- runApplication(
 			ctx, slog.New(slog.DiscardHandler), []string{"-data-dir", dataDir},
-			strings.NewReader(""), io.Discard, io.Discard, nil, slackClient,
+			strings.NewReader(""), io.Discard, io.Discard, applicationDependencies{slack: slackClient},
 		)
 	}()
 	select {

@@ -93,44 +93,23 @@ func run(
 	stdout, stderr io.Writer,
 	telegramClient *telegram.Client,
 ) error {
-	registryClient := &http.Client{Timeout: 30 * time.Second}
-	slackClient := slack.NewClient(slack.APIBaseURL, &http.Client{Timeout: 15 * time.Second})
 	return runApplication(
-		ctx, logger, args, stdin, stdout, stderr, telegramClient, slackClient,
-		agentcatalog.NewRegistry("", registryClient),
+		ctx, logger, args, stdin, stdout, stderr, defaultApplicationDependencies(telegramClient),
 	)
 }
 
-func runWithClients(
-	ctx context.Context,
-	logger *slog.Logger,
-	args []string,
-	stdin io.Reader,
-	stdout, stderr io.Writer,
-	telegramClient *telegram.Client,
-	slackClient *slack.Client,
-) error {
-	registryClient := &http.Client{Timeout: 30 * time.Second}
-	return runApplication(
-		ctx, logger, args, stdin, stdout, stderr, telegramClient, slackClient,
-		agentcatalog.NewRegistry("", registryClient),
-	)
+type applicationDependencies struct {
+	telegram *telegram.Client
+	slack    *slack.Client
+	registry *agentcatalog.Registry
 }
 
-func runWithRegistry(
-	ctx context.Context,
-	logger *slog.Logger,
-	args []string,
-	stdin io.Reader,
-	stdout, stderr io.Writer,
-	telegramClient *telegram.Client,
-	registry *agentcatalog.Registry,
-) error {
-	return runApplication(
-		ctx, logger, args, stdin, stdout, stderr, telegramClient,
-		slack.NewClient(slack.APIBaseURL, &http.Client{Timeout: 15 * time.Second}),
-		registry,
-	)
+func defaultApplicationDependencies(telegramClient *telegram.Client) applicationDependencies {
+	return applicationDependencies{
+		telegram: telegramClient,
+		slack:    slack.NewClient(slack.APIBaseURL, &http.Client{Timeout: 15 * time.Second}),
+		registry: agentcatalog.NewRegistry("", &http.Client{Timeout: 30 * time.Second}),
+	}
 }
 
 func runApplication(
@@ -139,9 +118,7 @@ func runApplication(
 	args []string,
 	stdin io.Reader,
 	stdout, stderr io.Writer,
-	telegramClient *telegram.Client,
-	slackClient *slack.Client,
-	registry *agentcatalog.Registry,
+	dependencies applicationDependencies,
 ) error {
 	if len(args) == 1 && args[0] == "version" {
 		if _, err := fmt.Fprintf(stdout, "aethos %s (commit %s, built %s)\n", version, commit, buildDate); err != nil {
@@ -153,7 +130,7 @@ func runApplication(
 		return devPrompt(ctx, logger, args[2:], stdout, stderr)
 	}
 	if len(args) >= 1 && args[0] == "agents" {
-		return agentsCommand(ctx, args[1:], stdout, stderr, registry)
+		return agentsCommand(ctx, args[1:], stdout, stderr, dependencies.registry)
 	}
 
 	fs := flag.NewFlagSet("aethos", flag.ContinueOnError)
@@ -190,7 +167,7 @@ func runApplication(
 			return err
 		}
 	case errors.Is(err, os.ErrNotExist):
-		if telegramClient == nil {
+		if dependencies.telegram == nil {
 			return fmt.Errorf("start first-run setup: Telegram token validator is unavailable")
 		}
 		installed, installedErr := catalog.Installed()
@@ -206,7 +183,7 @@ func runApplication(
 				ID: installedAgent.ID, Name: installedAgent.Name, Type: string(installedAgent.Type),
 			})
 		}
-		configured, err = config.RunWizard(ctx, stdin, stdout, paths, telegramClient, choices)
+		configured, err = config.RunWizard(ctx, stdin, stdout, paths, dependencies.telegram, choices)
 		if err != nil {
 			return err
 		}
@@ -227,13 +204,13 @@ func runApplication(
 	runners := make([]channelRunner, 0, 3)
 	var telegramChannel *telegram.Channel
 	if configured.Telegram != nil {
-		if telegramClient == nil {
+		if dependencies.telegram == nil {
 			return fmt.Errorf("start Telegram Channel: client is unavailable")
 		}
 		telegramChannel, err = telegram.Open(
 			ctx,
 			paths.DatabaseFile,
-			telegramClient,
+			dependencies.telegram,
 			logger,
 			telegram.Settings{
 				Token:          configured.Telegram.BotToken,
@@ -253,10 +230,10 @@ func runApplication(
 		})
 	}
 	if configured.Slack != nil {
-		if slackClient == nil {
+		if dependencies.slack == nil {
 			return errors.Join(fmt.Errorf("start Slack Channel: client is unavailable"), closeTelegram(telegramChannel))
 		}
-		slackChannel, slackErr := slack.New(slackClient, logger, slack.Settings{
+		slackChannel, slackErr := slack.New(dependencies.slack, logger, slack.Settings{
 			AppToken:       configured.Slack.AppToken,
 			BotToken:       configured.Slack.BotToken,
 			ChannelID:      configured.Slack.ChannelID,
@@ -266,7 +243,6 @@ func runApplication(
 		if slackErr != nil {
 			return errors.Join(slackErr, closeTelegram(telegramChannel))
 		}
-		routes["slack"] = slackChannel
 		runners = append(runners, func(runCtx context.Context, _ *session.Manager) error {
 			return slackChannel.Run(runCtx)
 		})
@@ -288,6 +264,9 @@ func runApplication(
 	}
 	if len(runners) == 0 {
 		return errors.Join(fmt.Errorf("no configured Channel runtime is available"), closeTelegram(telegramChannel))
+	}
+	if len(routes) == 0 {
+		return errors.Join(runChannels(ctx, nil, runners...), closeTelegram(telegramChannel))
 	}
 	var manager *session.Manager
 	events, err := channeltypes.NewRouter(
