@@ -527,7 +527,7 @@ func TestRunStartsWithOnlySlackConfigured(t *testing.T) {
 			if err != nil {
 				return
 			}
-			defer connection.CloseNow()
+			defer func() { _ = connection.CloseNow() }()
 			select {
 			case connected <- struct{}{}:
 			default:

@@ -85,7 +85,7 @@ func (c *Client) UpdateMessage(ctx context.Context, botToken, channelID, timesta
 func (c *Client) call(ctx context.Context, token, method string, parameters, result any) error {
 	token = strings.TrimSpace(token)
 	if token == "" {
-		return fmt.Errorf("Slack %s token is required", method)
+		return fmt.Errorf("slack %s token is required", method)
 	}
 	body, err := json.Marshal(parameters)
 	if err != nil {

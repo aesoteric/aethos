@@ -291,7 +291,7 @@ func (a *slackFixtureAPI) handleSocket(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	defer connection.CloseNow()
+	defer func() { _ = connection.CloseNow() }()
 	a.mu.Lock()
 	a.connections++
 	var script socketScript

@@ -36,7 +36,7 @@ type channelOptions struct {
 func WithReconnectBackoff(initial, maximum time.Duration) Option {
 	return func(options *channelOptions) error {
 		if initial <= 0 || maximum < initial {
-			return fmt.Errorf("Slack reconnect backoff must be positive and maximum must not be less than initial")
+			return fmt.Errorf("slack reconnect backoff must be positive and maximum must not be less than initial")
 		}
 		options.initialBackoff = initial
 		options.maximumBackoff = maximum
@@ -61,7 +61,7 @@ type Channel struct {
 // New constructs a Slack Channel.
 func New(client *Client, logger *slog.Logger, settings Settings, option ...Option) (*Channel, error) {
 	if client == nil {
-		return nil, fmt.Errorf("Slack client is required")
+		return nil, fmt.Errorf("slack client is required")
 	}
 	if logger == nil {
 		return nil, fmt.Errorf("logger is required")
@@ -70,29 +70,29 @@ func New(client *Client, logger *slog.Logger, settings Settings, option ...Optio
 	settings.BotToken = strings.TrimSpace(settings.BotToken)
 	settings.ChannelID = strings.TrimSpace(settings.ChannelID)
 	if settings.AppToken == "" {
-		return nil, fmt.Errorf("Slack app token is required")
+		return nil, fmt.Errorf("slack app token is required")
 	}
 	if settings.BotToken == "" {
-		return nil, fmt.Errorf("Slack bot token is required")
+		return nil, fmt.Errorf("slack bot token is required")
 	}
 	if settings.ChannelID == "" {
-		return nil, fmt.Errorf("Slack channel ID is required")
+		return nil, fmt.Errorf("slack channel ID is required")
 	}
 	if len(settings.AllowedUserIDs) == 0 {
-		return nil, fmt.Errorf("Slack allowed user IDs are required")
+		return nil, fmt.Errorf("slack allowed user IDs are required")
 	}
 	allowed := make(map[string]struct{}, len(settings.AllowedUserIDs))
 	for _, userID := range settings.AllowedUserIDs {
 		userID = strings.TrimSpace(userID)
 		if userID == "" {
-			return nil, fmt.Errorf("Slack allowed user ID cannot be empty")
+			return nil, fmt.Errorf("slack allowed user ID cannot be empty")
 		}
 		allowed[userID] = struct{}{}
 	}
 	options := channelOptions{initialBackoff: time.Second, maximumBackoff: 30 * time.Second}
 	for _, configure := range option {
 		if configure == nil {
-			return nil, fmt.Errorf("Slack Channel option is required")
+			return nil, fmt.Errorf("slack Channel option is required")
 		}
 		if err := configure(&options); err != nil {
 			return nil, err
@@ -107,7 +107,7 @@ func (c *Channel) Run(ctx context.Context) error {
 	c.mu.Lock()
 	if c.running {
 		c.mu.Unlock()
-		return fmt.Errorf("Slack Channel is already running")
+		return fmt.Errorf("slack Channel is already running")
 	}
 	c.running = true
 	c.mu.Unlock()
@@ -156,7 +156,7 @@ func (c *Channel) runConnection(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("connect Slack Socket Mode websocket: %w", err)
 	}
-	defer connection.CloseNow()
+	defer func() { _ = connection.CloseNow() }()
 	for {
 		messageType, contents, err := connection.Read(ctx)
 		if err != nil {
@@ -187,7 +187,7 @@ func (c *Channel) runConnection(ctx context.Context) error {
 			}
 		}
 		if envelope.Type == "disconnect" {
-			return fmt.Errorf("Slack requested disconnect: %s", envelope.Reason)
+			return fmt.Errorf("slack requested disconnect: %s", envelope.Reason)
 		}
 		if envelope.Type == "events_api" {
 			if err := c.handleEvent(ctx, envelope.Payload); err != nil {
