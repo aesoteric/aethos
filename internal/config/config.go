@@ -42,12 +42,14 @@ func (duration Duration) MarshalText() ([]byte, error) {
 }
 
 const (
-	dataDirEnv      = "AETHOS_DATA_DIR"
-	botTokenEnv     = "AETHOS_TELEGRAM_BOT_TOKEN"
-	restListenEnv   = "AETHOS_REST_LISTEN_ADDRESS"
-	restTokenEnv    = "AETHOS_REST_BEARER_TOKEN"
-	workspaceEnv    = "AETHOS_WORKSPACE"
-	defaultAgentEnv = "AETHOS_DEFAULT_AGENT"
+	dataDirEnv       = "AETHOS_DATA_DIR"
+	botTokenEnv      = "AETHOS_TELEGRAM_BOT_TOKEN"
+	restListenEnv    = "AETHOS_REST_LISTEN_ADDRESS"
+	restTokenEnv     = "AETHOS_REST_BEARER_TOKEN"
+	slackAppTokenEnv = "AETHOS_SLACK_APP_TOKEN"
+	slackBotTokenEnv = "AETHOS_SLACK_BOT_TOKEN"
+	workspaceEnv     = "AETHOS_WORKSPACE"
+	defaultAgentEnv  = "AETHOS_DEFAULT_AGENT"
 )
 
 // Paths names every persistent location rooted in aethos's data directory.
@@ -73,6 +75,14 @@ type REST struct {
 	BearerToken   string `toml:"bearer_token"`
 }
 
+// Slack holds configuration for the Slack Channel.
+type Slack struct {
+	AppToken       string   `toml:"app_token"`
+	BotToken       string   `toml:"bot_token"`
+	ChannelID      string   `toml:"channel_id"`
+	AllowedUserIDs []string `toml:"allowed_user_ids"`
+}
+
 // Permissions configures the fail-safe deadline and exact Agent tool kinds
 // that the permission gate may approve without Channel interaction.
 type Permissions struct {
@@ -86,8 +96,9 @@ type Config struct {
 	DefaultAgent string      `toml:"default_agent"`
 	IdleTimeout  Duration    `toml:"idle_timeout"`
 	Permissions  Permissions `toml:"permissions"`
-	REST         REST        `toml:"rest"`
-	Telegram     Telegram    `toml:"telegram"`
+	REST         *REST       `toml:"rest,omitempty"`
+	Slack        *Slack      `toml:"slack,omitempty"`
+	Telegram     *Telegram   `toml:"telegram,omitempty"`
 }
 
 // ValidateTelegramAllowedUserIDs enforces the fail-closed Telegram access
@@ -165,6 +176,9 @@ func Load(path string) (Config, error) {
 		}
 		return Config{}, fmt.Errorf("unknown config field: %s", strings.Join(fields, ", "))
 	}
+	if cfg.REST != nil && strings.TrimSpace(cfg.REST.ListenAddress) == "" {
+		cfg.REST.ListenAddress = DefaultRESTListenAddress
+	}
 
 	applyEnvironment(&cfg)
 	if err := cfg.Validate(); err != nil {
@@ -177,19 +191,24 @@ func defaultConfig() Config {
 	return Config{
 		IdleTimeout: Duration(DefaultIdleTimeout),
 		Permissions: Permissions{Timeout: Duration(permission.DefaultTimeout)},
-		REST:        REST{ListenAddress: DefaultRESTListenAddress},
 	}
 }
 
 func applyEnvironment(cfg *Config) {
-	if value, ok := os.LookupEnv(botTokenEnv); ok {
+	if value, ok := os.LookupEnv(botTokenEnv); ok && cfg.Telegram != nil {
 		cfg.Telegram.BotToken = value
 	}
-	if value, ok := os.LookupEnv(restTokenEnv); ok {
+	if value, ok := os.LookupEnv(restTokenEnv); ok && cfg.REST != nil {
 		cfg.REST.BearerToken = value
 	}
-	if value, ok := os.LookupEnv(restListenEnv); ok && strings.TrimSpace(value) != "" {
+	if value, ok := os.LookupEnv(restListenEnv); ok && strings.TrimSpace(value) != "" && cfg.REST != nil {
 		cfg.REST.ListenAddress = value
+	}
+	if value, ok := os.LookupEnv(slackAppTokenEnv); ok && cfg.Slack != nil {
+		cfg.Slack.AppToken = value
+	}
+	if value, ok := os.LookupEnv(slackBotTokenEnv); ok && cfg.Slack != nil {
+		cfg.Slack.BotToken = value
 	}
 	if value, ok := os.LookupEnv(workspaceEnv); ok {
 		cfg.Workspace = value
@@ -201,9 +220,6 @@ func applyEnvironment(cfg *Config) {
 
 // Validate reports the first missing or invalid required value.
 func (c Config) Validate() error {
-	if strings.TrimSpace(c.Telegram.BotToken) == "" {
-		return fmt.Errorf("telegram.bot_token is required (set it in config.toml or %s)", botTokenEnv)
-	}
 	if strings.TrimSpace(c.Workspace) == "" {
 		return fmt.Errorf("workspace is required (set it in config.toml or %s)", workspaceEnv)
 	}
@@ -213,17 +229,41 @@ func (c Config) Validate() error {
 	if strings.TrimSpace(c.DefaultAgent) == "" {
 		return fmt.Errorf("default_agent is required (set it in config.toml or %s)", defaultAgentEnv)
 	}
-	if strings.TrimSpace(c.REST.ListenAddress) == "" {
-		return fmt.Errorf("rest.listen_address is required")
+	if c.Telegram == nil && c.Slack == nil && c.REST == nil {
+		return fmt.Errorf("at least one Channel section ([telegram], [slack], or [rest]) is required")
 	}
-	if strings.TrimSpace(c.REST.BearerToken) == "" {
-		return fmt.Errorf("rest.bearer_token is required (set it in config.toml or %s)", restTokenEnv)
+	if c.Telegram != nil {
+		if strings.TrimSpace(c.Telegram.BotToken) == "" {
+			return fmt.Errorf("telegram.bot_token is required (set it in config.toml or %s)", botTokenEnv)
+		}
+		if c.Telegram.ChatID == 0 {
+			return fmt.Errorf("telegram.chat_id is required")
+		}
+		if err := ValidateTelegramAllowedUserIDs(c.Telegram.AllowedUserIDs); err != nil {
+			return err
+		}
 	}
-	if c.Telegram.ChatID == 0 {
-		return fmt.Errorf("telegram.chat_id is required")
+	if c.Slack != nil {
+		if !strings.HasPrefix(strings.TrimSpace(c.Slack.AppToken), "xapp-") {
+			return fmt.Errorf("slack.app_token is required and must start with xapp- (set it in config.toml or %s)", slackAppTokenEnv)
+		}
+		if !strings.HasPrefix(strings.TrimSpace(c.Slack.BotToken), "xoxb-") {
+			return fmt.Errorf("slack.bot_token is required and must start with xoxb- (set it in config.toml or %s)", slackBotTokenEnv)
+		}
+		if strings.TrimSpace(c.Slack.ChannelID) == "" {
+			return fmt.Errorf("slack.channel_id is required")
+		}
+		if err := validateSlackAllowedUserIDs(c.Slack.AllowedUserIDs); err != nil {
+			return err
+		}
 	}
-	if err := ValidateTelegramAllowedUserIDs(c.Telegram.AllowedUserIDs); err != nil {
-		return err
+	if c.REST != nil {
+		if strings.TrimSpace(c.REST.ListenAddress) == "" {
+			return fmt.Errorf("rest.listen_address is required")
+		}
+		if strings.TrimSpace(c.REST.BearerToken) == "" {
+			return fmt.Errorf("rest.bearer_token is required (set it in config.toml or %s)", restTokenEnv)
+		}
 	}
 	if c.IdleTimeout <= 0 {
 		return fmt.Errorf("idle_timeout must be greater than zero")
@@ -240,6 +280,23 @@ func (c Config) Validate() error {
 			return fmt.Errorf("permissions.auto_approve contains duplicate tool kind %q", kind)
 		}
 		seenKinds[kind] = struct{}{}
+	}
+	return nil
+}
+
+func validateSlackAllowedUserIDs(userIDs []string) error {
+	if len(userIDs) == 0 {
+		return fmt.Errorf("slack.allowed_user_ids must contain at least one Slack user ID")
+	}
+	seen := make(map[string]struct{}, len(userIDs))
+	for _, userID := range userIDs {
+		if strings.TrimSpace(userID) == "" {
+			return fmt.Errorf("slack.allowed_user_ids cannot contain an empty Slack user ID")
+		}
+		if _, duplicate := seen[userID]; duplicate {
+			return fmt.Errorf("slack.allowed_user_ids contains duplicate Slack user ID %q", userID)
+		}
+		seen[userID] = struct{}{}
 	}
 	return nil
 }

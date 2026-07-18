@@ -73,6 +73,8 @@ func RunWizard(
 	effective := defaultConfig()
 	effective.Workspace = workspace
 	effective.DefaultAgent = defaultAgent
+	effective.REST = &REST{ListenAddress: DefaultRESTListenAddress}
+	effective.Telegram = &Telegram{}
 	effective.REST.BearerToken = restToken
 	effective.Telegram.BotToken = token
 	effective.Telegram.ChatID = chatID

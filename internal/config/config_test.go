@@ -118,6 +118,217 @@ func TestLoadReadsFixtureAndAppliesEnvironmentOverrides(t *testing.T) {
 	}
 }
 
+func TestLoadEnablesOnlyPresentChannelSections(t *testing.T) {
+	tests := []struct {
+		name         string
+		channels     string
+		wantTelegram bool
+		wantSlack    bool
+	}{
+		{
+			name: "Telegram only",
+			channels: `[telegram]
+bot_token = "telegram-token"
+chat_id = -1001
+allowed_user_ids = [123]
+`,
+			wantTelegram: true,
+		},
+		{
+			name: "Slack only",
+			channels: `[slack]
+app_token = "xapp-file-token"
+bot_token = "xoxb-file-token"
+channel_id = "C0123456789"
+allowed_user_ids = ["U0123456789"]
+`,
+			wantSlack: true,
+		},
+		{
+			name: "Telegram and Slack",
+			channels: `[telegram]
+bot_token = "telegram-token"
+chat_id = -1001
+allowed_user_ids = [123]
+
+[slack]
+app_token = "xapp-file-token"
+bot_token = "xoxb-file-token"
+channel_id = "C0123456789"
+allowed_user_ids = ["U0123456789"]
+`,
+			wantTelegram: true,
+			wantSlack:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			writeFixture(t, path, `workspace = "/workspace"
+default_agent = "codex-acp"
+
+`+tt.channels)
+
+			got, err := config.Load(path)
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if (got.Telegram != nil) != tt.wantTelegram {
+				t.Errorf("Telegram configured = %t, want %t", got.Telegram != nil, tt.wantTelegram)
+			}
+			if (got.Slack != nil) != tt.wantSlack {
+				t.Errorf("Slack configured = %t, want %t", got.Slack != nil, tt.wantSlack)
+			}
+			if got.REST != nil {
+				t.Error("REST configured without a [rest] section")
+			}
+		})
+	}
+}
+
+func TestLoadRejectsConfigWithoutAChannelSection(t *testing.T) {
+	t.Setenv("AETHOS_TELEGRAM_BOT_TOKEN", "environment-telegram-token")
+	t.Setenv("AETHOS_SLACK_APP_TOKEN", "xapp-environment-token")
+	t.Setenv("AETHOS_SLACK_BOT_TOKEN", "xoxb-environment-token")
+	t.Setenv("AETHOS_REST_BEARER_TOKEN", "environment-rest-token")
+	path := filepath.Join(t.TempDir(), "config.toml")
+	writeFixture(t, path, `workspace = "/workspace"
+default_agent = "codex-acp"
+`)
+
+	_, err := config.Load(path)
+	if err == nil || !strings.Contains(err.Error(), "at least one Channel section") {
+		t.Fatalf("Load error = %v, want a clear missing Channel diagnostic", err)
+	}
+}
+
+func TestLoadValidatesPresentSlackSectionFailClosed(t *testing.T) {
+	tests := []struct {
+		name      string
+		slack     string
+		wantError string
+	}{
+		{
+			name: "missing app token",
+			slack: `bot_token = "xoxb-bot-token"
+channel_id = "C0123456789"
+allowed_user_ids = ["U0123456789"]`,
+			wantError: "slack.app_token",
+		},
+		{
+			name: "invalid app token",
+			slack: `app_token = "not-an-app-token"
+bot_token = "xoxb-bot-token"
+channel_id = "C0123456789"
+allowed_user_ids = ["U0123456789"]`,
+			wantError: "must start with xapp-",
+		},
+		{
+			name: "missing bot token",
+			slack: `app_token = "xapp-app-token"
+channel_id = "C0123456789"
+allowed_user_ids = ["U0123456789"]`,
+			wantError: "slack.bot_token",
+		},
+		{
+			name: "invalid bot token",
+			slack: `app_token = "xapp-app-token"
+bot_token = "not-a-bot-token"
+channel_id = "C0123456789"
+allowed_user_ids = ["U0123456789"]`,
+			wantError: "must start with xoxb-",
+		},
+		{
+			name: "missing channel ID",
+			slack: `app_token = "xapp-app-token"
+bot_token = "xoxb-bot-token"
+allowed_user_ids = ["U0123456789"]`,
+			wantError: "slack.channel_id",
+		},
+		{
+			name: "empty allowed user IDs",
+			slack: `app_token = "xapp-app-token"
+bot_token = "xoxb-bot-token"
+channel_id = "C0123456789"
+allowed_user_ids = []`,
+			wantError: "at least one Slack user ID",
+		},
+		{
+			name: "blank allowed user ID",
+			slack: `app_token = "xapp-app-token"
+bot_token = "xoxb-bot-token"
+channel_id = "C0123456789"
+allowed_user_ids = [" "]`,
+			wantError: "empty Slack user ID",
+		},
+		{
+			name: "duplicate allowed user ID",
+			slack: `app_token = "xapp-app-token"
+bot_token = "xoxb-bot-token"
+channel_id = "C0123456789"
+allowed_user_ids = ["U0123456789", "U0123456789"]`,
+			wantError: "duplicate Slack user ID",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			writeFixture(t, path, `workspace = "/workspace"
+default_agent = "codex-acp"
+
+[slack]
+`+tt.slack+"\n")
+
+			_, err := config.Load(path)
+			if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("Load error = %v, want it to contain %q", err, tt.wantError)
+			}
+		})
+	}
+}
+
+func TestLoadAppliesSlackTokenEnvironmentOverrides(t *testing.T) {
+	t.Setenv("AETHOS_SLACK_APP_TOKEN", "xapp-environment-token")
+	t.Setenv("AETHOS_SLACK_BOT_TOKEN", "xoxb-environment-token")
+	path := filepath.Join(t.TempDir(), "config.toml")
+	writeFixture(t, path, `workspace = "/workspace"
+default_agent = "codex-acp"
+
+[slack]
+app_token = "invalid-file-app-token"
+bot_token = "invalid-file-bot-token"
+channel_id = "C0123456789"
+allowed_user_ids = ["U0123456789"]
+`)
+
+	got, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.Slack.AppToken != "xapp-environment-token" {
+		t.Errorf("Slack.AppToken = %q, want environment override", got.Slack.AppToken)
+	}
+	if got.Slack.BotToken != "xoxb-environment-token" {
+		t.Errorf("Slack.BotToken = %q, want environment override", got.Slack.BotToken)
+	}
+}
+
+func TestLoadValidatesPresentRESTSectionFailClosed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	writeFixture(t, path, `workspace = "/workspace"
+default_agent = "codex-acp"
+
+[rest]
+`)
+
+	_, err := config.Load(path)
+	if err == nil || !strings.Contains(err.Error(), "rest.bearer_token") {
+		t.Fatalf("Load error = %v, want present REST section validated in full", err)
+	}
+}
+
 func TestLoadRequiresTelegramForumAndAllowlist(t *testing.T) {
 	t.Setenv("AETHOS_REST_BEARER_TOKEN", "rest-token")
 	tests := []struct {
@@ -169,7 +380,7 @@ func TestLoadDefaultsAndValidatesIdleTimeout(t *testing.T) {
 	t.Setenv("AETHOS_DEFAULT_AGENT", "codex-acp")
 
 	path := filepath.Join(t.TempDir(), "config.toml")
-	writeFixture(t, path, "[telegram]\nbot_token = \"\"\nchat_id = -1001\nallowed_user_ids = [123]\n")
+	writeFixture(t, path, "[telegram]\nbot_token = \"\"\nchat_id = -1001\nallowed_user_ids = [123]\n\n[rest]\n")
 	got, err := config.Load(path)
 	if err != nil {
 		t.Fatalf("Load default idle timeout: %v", err)

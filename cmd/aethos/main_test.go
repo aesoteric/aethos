@@ -506,6 +506,214 @@ allowed_user_ids = [123]
 	}
 }
 
+func TestRunRejectsConfigWithoutChannelSection(t *testing.T) {
+	dataDir := t.TempDir()
+	contents := `workspace = "/workspace"
+default_agent = "codex-acp"
+`
+	if err := os.WriteFile(filepath.Join(dataDir, "config.toml"), []byte(contents), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	err := run(
+		t.Context(), slog.New(slog.DiscardHandler), []string{"-data-dir", dataDir},
+		strings.NewReader(""), io.Discard, io.Discard, nil,
+	)
+	if err == nil || !strings.Contains(err.Error(), "at least one Channel section") {
+		t.Fatalf("run error = %v, want a clear missing Channel diagnostic", err)
+	}
+}
+
+func TestRunStartsWithOnlySlackConfigured(t *testing.T) {
+	dataDir := t.TempDir()
+	catalog, err := agentcatalog.Open(filepath.Join(dataDir, "agents.json"), filepath.Join(dataDir, "agents"))
+	if err != nil {
+		t.Fatalf("open Agent catalog: %v", err)
+	}
+	_, err = catalog.Install(t.Context(), agentcatalog.RegistryAgent{
+		ID:      "codex-acp",
+		Name:    "Codex",
+		Version: "1.1.4",
+		Distribution: agentcatalog.Distribution{NPX: &agentcatalog.PackageDistribution{
+			Package: "@agentclientprotocol/codex-acp@1.1.4",
+		}},
+	}, nil)
+	if err != nil {
+		t.Fatalf("install Agent catalog fixture: %v", err)
+	}
+	configFile := filepath.Join(dataDir, "config.toml")
+	contents := `workspace = "/workspace"
+default_agent = "codex-acp"
+
+[slack]
+app_token = "xapp-app-token"
+bot_token = "xoxb-bot-token"
+channel_id = "C0123456789"
+allowed_user_ids = ["U0123456789"]
+`
+	if err := os.WriteFile(configFile, []byte(contents), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	err = run(
+		ctx, slog.New(slog.DiscardHandler), []string{"-data-dir", dataDir},
+		strings.NewReader(""), io.Discard, io.Discard, nil,
+	)
+	if err != nil {
+		t.Fatalf("run Slack-only config: %v", err)
+	}
+}
+
+func TestRunStartsOnlyConfiguredRESTChannel(t *testing.T) {
+	dataDir := t.TempDir()
+	catalog, err := agentcatalog.Open(filepath.Join(dataDir, "agents.json"), filepath.Join(dataDir, "agents"))
+	if err != nil {
+		t.Fatalf("open Agent catalog: %v", err)
+	}
+	_, err = catalog.Install(t.Context(), agentcatalog.RegistryAgent{
+		ID:      "codex-acp",
+		Name:    "Codex",
+		Version: "1.1.4",
+		Distribution: agentcatalog.Distribution{NPX: &agentcatalog.PackageDistribution{
+			Package: "@agentclientprotocol/codex-acp@1.1.4",
+		}},
+	}, nil)
+	if err != nil {
+		t.Fatalf("install Agent catalog fixture: %v", err)
+	}
+	configFile := filepath.Join(dataDir, "config.toml")
+	contents := `workspace = "/workspace"
+default_agent = "codex-acp"
+
+[rest]
+listen_address = "127.0.0.1:0"
+bearer_token = "rest-token"
+`
+	if err := os.WriteFile(configFile, []byte(contents), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	var logs synchronizedBuffer
+
+	done := make(chan error, 1)
+	go func() {
+		done <- run(
+			ctx, newLogger(&logs), []string{"-data-dir", dataDir},
+			strings.NewReader(""), io.Discard, io.Discard, nil,
+		)
+	}()
+	waitForRun(t, func() bool { return strings.Contains(logs.String(), "REST Channel listening") })
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("run REST-only config: %v", err)
+	}
+	if !strings.Contains(logs.String(), "REST Channel listening") {
+		t.Errorf("startup logs = %q, want configured REST Channel to run", logs.String())
+	}
+}
+
+func TestRunStartsOnlyConfiguredTelegramChannel(t *testing.T) {
+	var callsMu sync.Mutex
+	var calls []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		method := strings.TrimPrefix(r.URL.Path, "/botvalid-token/")
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		callsMu.Lock()
+		calls = append(calls, method)
+		callsMu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		switch method {
+		case "getMe":
+			fmt.Fprint(w, `{"ok":true,"result":{"id":123,"is_bot":true,"first_name":"aethos"}}`)
+		case "getChat":
+			fmt.Fprint(w, `{"ok":true,"result":{"id":-1001234567890,"type":"supergroup","title":"Aethos","is_forum":true}}`)
+		case "createForumTopic":
+			fmt.Fprint(w, `{"ok":true,"result":{"message_thread_id":101,"name":"Assistant"}}`)
+		case "sendMessage":
+			fmt.Fprint(w, `{"ok":true,"result":{"message_id":201,"chat":{"id":-1001234567890,"type":"supergroup"}}}`)
+		case "getUpdates":
+			<-r.Context().Done()
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	dataDir := t.TempDir()
+	catalog, err := agentcatalog.Open(filepath.Join(dataDir, "agents.json"), filepath.Join(dataDir, "agents"))
+	if err != nil {
+		t.Fatalf("open Agent catalog: %v", err)
+	}
+	_, err = catalog.Install(t.Context(), agentcatalog.RegistryAgent{
+		ID:      "codex-acp",
+		Name:    "Codex",
+		Version: "1.1.4",
+		Distribution: agentcatalog.Distribution{NPX: &agentcatalog.PackageDistribution{
+			Package: "@agentclientprotocol/codex-acp@1.1.4",
+		}},
+	}, nil)
+	if err != nil {
+		t.Fatalf("install Agent catalog fixture: %v", err)
+	}
+	configFile := filepath.Join(dataDir, "config.toml")
+	contents := `workspace = "/workspace"
+default_agent = "codex-acp"
+
+[telegram]
+bot_token = "valid-token"
+chat_id = -1001234567890
+allowed_user_ids = [123456789]
+`
+	if err := os.WriteFile(configFile, []byte(contents), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	var logs synchronizedBuffer
+	done := make(chan error, 1)
+	client := telegram.NewClient(server.URL, server.Client())
+	go func() {
+		done <- run(
+			ctx, newLogger(&logs), []string{"-data-dir", dataDir},
+			strings.NewReader(""), io.Discard, io.Discard, client,
+		)
+	}()
+	waitForRun(t, func() bool {
+		callsMu.Lock()
+		defer callsMu.Unlock()
+		return slices.Contains(calls, "getUpdates")
+	})
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("run Telegram-only config: %v", err)
+	}
+	if strings.Contains(logs.String(), "REST Channel listening") {
+		t.Errorf("startup logs = %q, unconfigured REST Channel ran", logs.String())
+	}
+}
+
+type synchronizedBuffer struct {
+	mu       sync.Mutex
+	contents strings.Builder
+}
+
+func (b *synchronizedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.contents.Write(p)
+}
+
+func (b *synchronizedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.contents.String()
+}
+
 func unsetEnv(t *testing.T, key string) {
 	t.Helper()
 	original, present := os.LookupEnv(key)

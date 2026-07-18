@@ -184,38 +184,57 @@ func runWithRegistry(
 			configured.DefaultAgent, configured.DefaultAgent, err,
 		)
 	}
-	if telegramClient == nil {
-		return fmt.Errorf("start Telegram Channel: client is unavailable")
-	}
 	if err := os.MkdirAll(paths.DataDir, 0o700); err != nil {
 		return fmt.Errorf("create data directory %q: %w", paths.DataDir, err)
 	}
 
-	bridge, err := telegram.Open(
-		ctx,
-		paths.DatabaseFile,
-		telegramClient,
-		logger,
-		telegram.Settings{
-			Token:          configured.Telegram.BotToken,
-			ChatID:         configured.Telegram.ChatID,
-			AllowedUserIDs: configured.Telegram.AllowedUserIDs,
-			DefaultAgent:   configured.DefaultAgent,
-			Workspace:      configured.Workspace,
-			Agents:         catalog,
-		},
-	)
-	if err != nil {
-		return err
+	routes := make(map[string]channeltypes.Channel)
+	runners := make([]channelRunner, 0, 2)
+	var bridge *telegram.Channel
+	if configured.Telegram != nil {
+		if telegramClient == nil {
+			return fmt.Errorf("start Telegram Channel: client is unavailable")
+		}
+		bridge, err = telegram.Open(
+			ctx,
+			paths.DatabaseFile,
+			telegramClient,
+			logger,
+			telegram.Settings{
+				Token:          configured.Telegram.BotToken,
+				ChatID:         configured.Telegram.ChatID,
+				AllowedUserIDs: configured.Telegram.AllowedUserIDs,
+				DefaultAgent:   configured.DefaultAgent,
+				Workspace:      configured.Workspace,
+				Agents:         catalog,
+			},
+		)
+		if err != nil {
+			return err
+		}
+		routes["telegram"] = bridge
+		runners = append(runners, func(runCtx context.Context, manager *session.Manager) error {
+			return bridge.Run(runCtx, manager)
+		})
 	}
-	api, err := rest.New(rest.Settings{
-		ListenAddress: configured.REST.ListenAddress,
-		BearerToken:   configured.REST.BearerToken,
-		Identity:      "api",
-		Agents:        catalog,
-	}, logger)
-	if err != nil {
-		return errors.Join(err, bridge.Close())
+	if configured.REST != nil {
+		api, restErr := rest.New(rest.Settings{
+			ListenAddress: configured.REST.ListenAddress,
+			BearerToken:   configured.REST.BearerToken,
+			Identity:      "api",
+			Agents:        catalog,
+		}, logger)
+		if restErr != nil {
+			return errors.Join(restErr, closeTelegram(bridge))
+		}
+		routes["rest"] = api
+		runners = append(runners, func(runCtx context.Context, manager *session.Manager) error {
+			return api.Run(runCtx, manager)
+		})
+	}
+	if len(runners) == 0 {
+		<-ctx.Done()
+		return nil
 	}
 	var manager *session.Manager
 	events, err := channeltypes.NewRouter(
@@ -223,13 +242,10 @@ func runWithRegistry(
 			record, lookupErr := manager.Get(eventCtx, sessionID)
 			return record.Owner.Channel, lookupErr
 		},
-		map[string]channeltypes.Channel{
-			"rest":     api,
-			"telegram": bridge,
-		},
+		routes,
 	)
 	if err != nil {
-		return errors.Join(err, bridge.Close())
+		return errors.Join(err, closeTelegram(bridge))
 	}
 	manager, err = session.Open(
 		ctx,
@@ -241,10 +257,10 @@ func runWithRegistry(
 		session.WithAutoApprove(configured.Permissions.AutoApprove...),
 	)
 	if err != nil {
-		return errors.Join(err, bridge.Close())
+		return errors.Join(err, closeTelegram(bridge))
 	}
-	runErr := runChannels(ctx, bridge, api, manager)
-	return errors.Join(runErr, manager.Close(), bridge.Close())
+	runErr := runChannels(ctx, manager, runners...)
+	return errors.Join(runErr, manager.Close(), closeTelegram(bridge))
 }
 
 func agentsCommand(
@@ -347,16 +363,29 @@ func installAgentCommand(
 	return nil
 }
 
-func runChannels(ctx context.Context, telegramChannel *telegram.Channel, restChannel *rest.Channel, manager *session.Manager) error {
+type channelRunner func(context.Context, *session.Manager) error
+
+func runChannels(ctx context.Context, manager *session.Manager, runners ...channelRunner) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	results := make(chan error, 2)
-	go func() { results <- telegramChannel.Run(runCtx, manager) }()
-	go func() { results <- restChannel.Run(runCtx, manager) }()
-	first := <-results
+	results := make(chan error, len(runners))
+	for _, run := range runners {
+		go func() { results <- run(runCtx, manager) }()
+	}
+	errs := make([]error, 0, len(runners))
+	errs = append(errs, <-results)
 	cancel()
-	second := <-results
-	return errors.Join(first, second)
+	for range len(runners) - 1 {
+		errs = append(errs, <-results)
+	}
+	return errors.Join(errs...)
+}
+
+func closeTelegram(bridge *telegram.Channel) error {
+	if bridge == nil {
+		return nil
+	}
+	return bridge.Close()
 }
 
 // devPrompt is the hidden tracer-bullet command: spawn a locally
