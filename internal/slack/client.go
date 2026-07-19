@@ -63,23 +63,41 @@ func (c *Client) openSocketURL(ctx context.Context, appToken string) (string, er
 
 // PostMessage posts a top-level message or thread reply.
 func (c *Client) PostMessage(ctx context.Context, botToken, channelID, threadTS, text string) (Message, error) {
+	return c.postMessage(ctx, botToken, channelID, threadTS, text, nil)
+}
+
+func (c *Client) postMessage(
+	ctx context.Context,
+	botToken, channelID, threadTS, text string,
+	blocks *[]messageBlock,
+) (Message, error) {
 	var posted Message
 	err := c.call(ctx, botToken, "chat.postMessage", struct {
-		Channel  string `json:"channel"`
-		Text     string `json:"text"`
-		ThreadTS string `json:"thread_ts,omitempty"`
-	}{Channel: channelID, Text: text, ThreadTS: threadTS}, &posted)
+		Channel  string          `json:"channel"`
+		Text     string          `json:"text"`
+		ThreadTS string          `json:"thread_ts,omitempty"`
+		Blocks   *[]messageBlock `json:"blocks,omitempty"`
+	}{Channel: channelID, Text: text, ThreadTS: threadTS, Blocks: blocks}, &posted)
 	return posted, err
 }
 
 // UpdateMessage replaces the text of a message posted by the authenticated bot.
 func (c *Client) UpdateMessage(ctx context.Context, botToken, channelID, timestamp, text string) error {
+	return c.updateMessage(ctx, botToken, channelID, timestamp, text, nil)
+}
+
+func (c *Client) updateMessage(
+	ctx context.Context,
+	botToken, channelID, timestamp, text string,
+	blocks *[]messageBlock,
+) error {
 	var updated Message
 	return c.call(ctx, botToken, "chat.update", struct {
-		Channel string `json:"channel"`
-		TS      string `json:"ts"`
-		Text    string `json:"text"`
-	}{Channel: channelID, TS: timestamp, Text: text}, &updated)
+		Channel string          `json:"channel"`
+		TS      string          `json:"ts"`
+		Text    string          `json:"text"`
+		Blocks  *[]messageBlock `json:"blocks,omitempty"`
+	}{Channel: channelID, TS: timestamp, Text: text, Blocks: blocks}, &updated)
 }
 
 func (c *Client) call(ctx context.Context, token, method string, parameters, result any) error {

@@ -34,6 +34,8 @@ type sessionTarget interface {
 	Rename(context.Context, string, string) (session.Record, error)
 	List(context.Context) ([]session.Record, error)
 	CloseSession(context.Context, string) (session.Record, error)
+	Cancel(context.Context, string) error
+	ResolvePermission(context.Context, channeltypes.PermissionResponse) error
 }
 
 // Settings contains the credentials and access policy needed by the Slack
@@ -91,12 +93,14 @@ type Channel struct {
 	allowed  map[string]struct{}
 	identity authIdentity
 
-	mu       sync.Mutex
-	sessions sessionTarget
-	lanes    map[string]chan inboundPrompt
-	drafts   map[string]*messageDraft
-	running  bool
-	workers  sync.WaitGroup
+	mu            sync.Mutex
+	sessions      sessionTarget
+	lanes         map[string]chan inboundPrompt
+	drafts        map[string]*messageDraft
+	permissions   map[string]*permissionMessage
+	nextControlID uint64
+	running       bool
+	workers       sync.WaitGroup
 }
 
 type sessionThread struct {
@@ -113,14 +117,17 @@ type messageDraft struct {
 	destination sessionThread
 	chunks      []draftChunk
 	lastKind    fragmentKind
+	cancelValue string
+	running     bool
 	dirty       bool
 	updated     chan struct{}
 }
 
 type draftChunk struct {
-	text         string
-	messageTS    string
-	lastSentText string
+	text          string
+	messageTS     string
+	lastSentText  string
+	cancelVisible bool
 }
 
 type fragmentKind uint8
@@ -190,6 +197,7 @@ func New(client *Client, logger *slog.Logger, settings Settings, option ...Optio
 	return &Channel{
 		client: client, logger: logger, settings: settings, options: options,
 		allowed: allowed, lanes: make(map[string]chan inboundPrompt), drafts: make(map[string]*messageDraft),
+		permissions: make(map[string]*permissionMessage),
 	}, nil
 }
 
@@ -297,6 +305,10 @@ func (c *Channel) runConnection(ctx context.Context) error {
 		if envelope.Type == "events_api" {
 			if err := c.handleEvent(ctx, envelope.Payload); err != nil {
 				c.logger.Error("handle Slack event", "envelope_id", envelope.EnvelopeID, "error", err)
+			}
+		} else if envelope.Type == "interactive" {
+			if err := c.handleInteraction(ctx, envelope.Payload); err != nil {
+				c.logger.Error("handle Slack interaction", "envelope_id", envelope.EnvelopeID, "error", err)
 			}
 		}
 	}
@@ -560,6 +572,12 @@ func (c *Channel) Send(ctx context.Context, event channeltypes.Event) error {
 			ctx, c.settings.BotToken, c.settings.ChannelID, record.TopicKey, rootText(record),
 		)
 	}
+	switch permissionEvent := event.AgentEvent.(type) {
+	case agent.PermissionRequested:
+		return c.presentPermission(ctx, record.TopicKey, permissionEvent)
+	case agent.PermissionResolved:
+		return c.finishPermission(ctx, permissionEvent)
+	}
 	fragment := renderEvent(event.AgentEvent)
 	if fragment.text == "" {
 		return nil
@@ -593,6 +611,8 @@ func (c *Channel) SendLifecycle(ctx context.Context, event channeltypes.Lifecycl
 		return err
 	case channeltypes.PromptFinished:
 		flushErr := c.waitForDraft(ctx, record.ID)
+		c.finishDraft(record.ID)
+		finishDraftErr := c.waitForDraft(ctx, record.ID)
 		text := "Prompt finished: " + string(lifecycle.StopReason) + "."
 		if lifecycle.Error != "" {
 			text = "Prompt finished with error: " + lifecycle.Error
@@ -600,7 +620,7 @@ func (c *Channel) SendLifecycle(ctx context.Context, event channeltypes.Lifecycl
 		_, postErr := c.client.PostMessage(
 			ctx, c.settings.BotToken, c.settings.ChannelID, record.TopicKey, text,
 		)
-		return errors.Join(flushErr, postErr)
+		return errors.Join(flushErr, finishDraftErr, postErr)
 	default:
 		return nil
 	}
@@ -618,19 +638,32 @@ func (c *Channel) sessionRecord(ctx context.Context, sessionID string) (session.
 
 func (c *Channel) beginDraft(destination sessionThread) {
 	c.mu.Lock()
-	c.drafts[destination.sessionID] = newMessageDraft(destination)
+	c.nextControlID++
+	c.drafts[destination.sessionID] = newMessageDraft(
+		destination,
+		fmt.Sprintf("%s:%d", destination.sessionID, c.nextControlID),
+	)
 	c.mu.Unlock()
 }
 
-func newMessageDraft(destination sessionThread) *messageDraft {
-	return &messageDraft{destination: destination, updated: make(chan struct{}, 1)}
+func newMessageDraft(destination sessionThread, cancelValue string) *messageDraft {
+	return &messageDraft{
+		destination: destination,
+		cancelValue: cancelValue,
+		running:     true,
+		updated:     make(chan struct{}, 1),
+	}
 }
 
 func (c *Channel) appendDraft(destination sessionThread, fragment eventFragment) {
 	c.mu.Lock()
 	draft := c.drafts[destination.sessionID]
 	if draft == nil {
-		draft = newMessageDraft(destination)
+		c.nextControlID++
+		draft = newMessageDraft(
+			destination,
+			fmt.Sprintf("%s:%d", destination.sessionID, c.nextControlID),
+		)
 		c.drafts[destination.sessionID] = draft
 	}
 	continuous := fragment.kind == draft.lastKind &&
@@ -685,6 +718,8 @@ type draftWrite struct {
 	index       int
 	messageTS   string
 	text        string
+	showCancel  bool
+	cancelValue string
 }
 
 func (c *Channel) flushOne(ctx context.Context) {
@@ -695,12 +730,14 @@ func (c *Channel) flushOne(ctx context.Context) {
 	var err error
 	var posted Message
 	if write.messageTS == "" {
-		posted, err = c.client.PostMessage(
-			ctx, c.settings.BotToken, c.settings.ChannelID, write.destination.threadTS, write.text,
+		blocks := draftBlocks(write.text, write.showCancel, write.cancelValue)
+		posted, err = c.client.postMessage(
+			ctx, c.settings.BotToken, c.settings.ChannelID, write.destination.threadTS, write.text, &blocks,
 		)
 	} else {
-		err = c.client.UpdateMessage(
-			ctx, c.settings.BotToken, c.settings.ChannelID, write.messageTS, write.text,
+		blocks := draftBlocks(write.text, write.showCancel, write.cancelValue)
+		err = c.client.updateMessage(
+			ctx, c.settings.BotToken, c.settings.ChannelID, write.messageTS, write.text, &blocks,
 		)
 	}
 	if err != nil {
@@ -719,6 +756,7 @@ func (c *Channel) flushOne(ctx context.Context) {
 		chunk.messageTS = posted.TS
 	}
 	chunk.lastSentText = write.text
+	chunk.cancelVisible = write.showCancel
 	current.dirty = draftNeedsWrite(current)
 	notifyDraft(current)
 }
@@ -731,13 +769,16 @@ func (c *Channel) nextDraftWrite() (draftWrite, bool) {
 			continue
 		}
 		for index, chunk := range draft.chunks {
-			if chunk.messageTS == "" || chunk.lastSentText != chunk.text {
+			if chunk.messageTS == "" || chunk.lastSentText != chunk.text ||
+				chunk.cancelVisible != draft.running {
 				return draftWrite{
 					destination: draft.destination,
 					draft:       draft,
 					index:       index,
 					messageTS:   chunk.messageTS,
 					text:        chunk.text,
+					showCancel:  draft.running,
+					cancelValue: draft.cancelValue,
 				}, true
 			}
 		}
@@ -749,11 +790,33 @@ func (c *Channel) nextDraftWrite() (draftWrite, bool) {
 
 func draftNeedsWrite(draft *messageDraft) bool {
 	for _, chunk := range draft.chunks {
-		if chunk.messageTS == "" || chunk.lastSentText != chunk.text {
+		if chunk.messageTS == "" || chunk.lastSentText != chunk.text ||
+			chunk.cancelVisible != draft.running {
 			return true
 		}
 	}
 	return false
+}
+
+func draftBlocks(text string, showCancel bool, cancelValue string) []messageBlock {
+	if !showCancel {
+		return []messageBlock{}
+	}
+	return interactiveMessageBlocks(
+		text,
+		button("Cancel", cancelPromptActionID, cancelValue, "danger"),
+	)
+}
+
+func (c *Channel) finishDraft(sessionID string) {
+	c.mu.Lock()
+	draft := c.drafts[sessionID]
+	if draft != nil && draft.running {
+		draft.running = false
+		draft.dirty = draftNeedsWrite(draft)
+		notifyDraft(draft)
+	}
+	c.mu.Unlock()
 }
 
 func notifyDraft(draft *messageDraft) {

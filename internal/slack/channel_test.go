@@ -245,6 +245,29 @@ func messageEnvelope(envelopeID, userID, channelID, text, threadTS string) strin
 	return string(encoded)
 }
 
+func blockActionEnvelope(
+	envelopeID, userID, channelID, messageTS, threadTS, actionID, value string,
+) string {
+	envelope := map[string]any{
+		"type":        "interactive",
+		"envelope_id": envelopeID,
+		"payload": map[string]any{
+			"type":    "block_actions",
+			"user":    map[string]any{"id": userID},
+			"channel": map[string]any{"id": channelID},
+			"message": map[string]any{"ts": messageTS, "thread_ts": threadTS},
+			"actions": []map[string]any{{
+				"type": "button", "action_id": actionID, "value": value,
+			}},
+		},
+	}
+	encoded, err := json.Marshal(envelope)
+	if err != nil {
+		panic(err)
+	}
+	return string(encoded)
+}
+
 type socketScript struct {
 	envelopes []string
 	drop      bool
@@ -487,6 +510,52 @@ func (a *slackFixtureAPI) hasUpdate(timestamp, text string) bool {
 		}
 	}
 	return false
+}
+
+func (a *slackFixtureAPI) threadButton(threadTS, text, label string) (string, string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, call := range a.calls {
+		if call.method != "chat.postMessage" || call.body["thread_ts"] != threadTS || call.body["text"] != text {
+			continue
+		}
+		if value := buttonValue(call.body["blocks"], label); value != "" {
+			return call.responseTS, value
+		}
+	}
+	return "", ""
+}
+
+func (a *slackFixtureAPI) hasUpdateWithoutButtons(timestamp, text string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, call := range a.calls {
+		if call.method != "chat.update" || call.body["ts"] != timestamp || call.body["text"] != text {
+			continue
+		}
+		blocks, present := call.body["blocks"].([]any)
+		if present && len(blocks) == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func buttonValue(rawBlocks any, label string) string {
+	blocks, _ := rawBlocks.([]any)
+	for _, rawBlock := range blocks {
+		block, _ := rawBlock.(map[string]any)
+		elements, _ := block["elements"].([]any)
+		for _, rawElement := range elements {
+			element, _ := rawElement.(map[string]any)
+			text, _ := element["text"].(map[string]any)
+			if text["text"] == label {
+				value, _ := element["value"].(string)
+				return value
+			}
+		}
+	}
+	return ""
 }
 
 func (a *slackFixtureAPI) threadPostTimestamp(threadTS, text string) string {
