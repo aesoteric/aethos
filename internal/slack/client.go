@@ -42,6 +42,18 @@ func NewClient(baseURL string, httpClient *http.Client) *Client {
 	return &Client{baseURL: strings.TrimRight(baseURL, "/"), httpClient: httpClient}
 }
 
+// ValidateBotToken checks a bot token with Slack's authenticated identity endpoint.
+func (c *Client) ValidateBotToken(ctx context.Context, botToken string) error {
+	_, err := c.authenticate(ctx, botToken)
+	return err
+}
+
+// ValidateAppToken checks an app-level token by requesting a Socket Mode URL.
+func (c *Client) ValidateAppToken(ctx context.Context, appToken string) error {
+	_, err := c.openSocketURL(ctx, appToken)
+	return err
+}
+
 func (c *Client) authenticate(ctx context.Context, botToken string) (authIdentity, error) {
 	var identity authIdentity
 	err := c.call(ctx, botToken, "auth.test", struct{}{}, &identity)

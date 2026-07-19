@@ -15,9 +15,15 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
-// TokenValidator checks a Telegram bot token at Telegram's protocol edge.
-type TokenValidator interface {
+// TelegramTokenValidator checks a Telegram bot token at Telegram's protocol edge.
+type TelegramTokenValidator interface {
 	ValidateToken(context.Context, string) error
+}
+
+// SlackTokenValidator checks Slack credentials at Slack's protocol edge.
+type SlackTokenValidator interface {
+	ValidateAppToken(context.Context, string) error
+	ValidateBotToken(context.Context, string) error
 }
 
 // AgentChoice is one installed Agent offered by the setup wizard.
@@ -35,28 +41,76 @@ func RunWizard(
 	input io.Reader,
 	output io.Writer,
 	paths Paths,
-	validator TokenValidator,
+	telegramValidator TelegramTokenValidator,
+	slackValidator SlackTokenValidator,
 	agents []AgentChoice,
 ) (Config, error) {
-	if validator == nil {
-		return Config{}, fmt.Errorf("Telegram token validator is required")
-	}
-
 	interaction := wizardInteraction{reader: bufio.NewReader(input), output: output}
 	fmt.Fprintln(output, "No config.toml found. Let's set up aethos.")
 
-	token, tokenFromEnvironment, err := interaction.collectToken(ctx, validator)
+	channels, err := interaction.collectChannels()
 	if err != nil {
 		return Config{}, err
 	}
-	chatID, err := interaction.collectChatID()
-	if err != nil {
-		return Config{}, err
+	var telegramConfig *Telegram
+	var telegramTokenFromEnvironment bool
+	if channels.telegram {
+		if telegramValidator == nil {
+			return Config{}, fmt.Errorf("Telegram token validator is required")
+		}
+		token, fromEnvironment, collectErr := interaction.collectTelegramToken(ctx, telegramValidator)
+		if collectErr != nil {
+			return Config{}, collectErr
+		}
+		chatID, collectErr := interaction.collectTelegramChatID()
+		if collectErr != nil {
+			return Config{}, collectErr
+		}
+		allowedUserIDs, collectErr := interaction.collectTelegramAllowedUserIDs()
+		if collectErr != nil {
+			return Config{}, collectErr
+		}
+		telegramConfig = &Telegram{
+			BotToken: token, ChatID: chatID, AllowedUserIDs: allowedUserIDs,
+		}
+		telegramTokenFromEnvironment = fromEnvironment
 	}
-	allowedUserIDs, err := interaction.collectAllowedUserIDs()
-	if err != nil {
-		return Config{}, err
+
+	var slackConfig *Slack
+	var slackAppTokenFromEnvironment, slackBotTokenFromEnvironment bool
+	if channels.slack {
+		if slackValidator == nil {
+			return Config{}, fmt.Errorf("Slack token validator is required")
+		}
+		appToken, fromEnvironment, collectErr := interaction.collectSlackToken(
+			ctx, slackAppTokenEnv, "Slack app-level token: ", "Slack app-level token", "xapp-",
+			slackValidator.ValidateAppToken,
+		)
+		if collectErr != nil {
+			return Config{}, collectErr
+		}
+		slackAppTokenFromEnvironment = fromEnvironment
+		botToken, fromEnvironment, collectErr := interaction.collectSlackToken(
+			ctx, slackBotTokenEnv, "Slack bot token: ", "Slack bot token", "xoxb-",
+			slackValidator.ValidateBotToken,
+		)
+		if collectErr != nil {
+			return Config{}, collectErr
+		}
+		slackBotTokenFromEnvironment = fromEnvironment
+		channelID, collectErr := interaction.collectSlackChannelID()
+		if collectErr != nil {
+			return Config{}, collectErr
+		}
+		allowedUserIDs, collectErr := interaction.collectSlackAllowedUserIDs()
+		if collectErr != nil {
+			return Config{}, collectErr
+		}
+		slackConfig = &Slack{
+			AppToken: appToken, BotToken: botToken, ChannelID: channelID, AllowedUserIDs: allowedUserIDs,
+		}
 	}
+
 	workspace, err := interaction.collectWorkspace()
 	if err != nil {
 		return Config{}, err
@@ -65,30 +119,25 @@ func RunWizard(
 	if err != nil {
 		return Config{}, err
 	}
-	restToken, restTokenFromEnvironment, err := interaction.collectSecret(restTokenEnv, "REST bearer token: ")
-	if err != nil {
-		return Config{}, err
-	}
 
 	effective := defaultConfig()
 	effective.Workspace = workspace
 	effective.DefaultAgent = defaultAgent
-	effective.REST = &REST{ListenAddress: DefaultRESTListenAddress}
-	effective.Telegram = &Telegram{}
-	effective.REST.BearerToken = restToken
-	effective.Telegram.BotToken = token
-	effective.Telegram.ChatID = chatID
-	effective.Telegram.AllowedUserIDs = allowedUserIDs
+	effective.Telegram = telegramConfig
+	effective.Slack = slackConfig
 	if err := effective.Validate(); err != nil {
 		return Config{}, fmt.Errorf("validate setup: %w", err)
 	}
 
 	persisted := effective
-	if tokenFromEnvironment {
+	if telegramTokenFromEnvironment {
 		persisted.Telegram.BotToken = ""
 	}
-	if restTokenFromEnvironment {
-		persisted.REST.BearerToken = ""
+	if slackAppTokenFromEnvironment {
+		persisted.Slack.AppToken = ""
+	}
+	if slackBotTokenFromEnvironment {
+		persisted.Slack.BotToken = ""
 	}
 	if err := writeCommentedConfig(paths, persisted); err != nil {
 		return Config{}, err
@@ -142,7 +191,35 @@ type wizardInteraction struct {
 	output io.Writer
 }
 
-func (i wizardInteraction) collectChatID() (int64, error) {
+type selectedChannels struct {
+	telegram bool
+	slack    bool
+}
+
+func (i wizardInteraction) collectChannels() (selectedChannels, error) {
+	fmt.Fprintln(i.output, "Channels:")
+	fmt.Fprintln(i.output, "  1 — Telegram")
+	fmt.Fprintln(i.output, "  2 — Slack")
+	fmt.Fprintln(i.output, "  3 — Telegram and Slack")
+	for {
+		value, err := i.prompt("Choose Channels [1-3]: ")
+		if err != nil {
+			return selectedChannels{}, err
+		}
+		switch value {
+		case "1":
+			return selectedChannels{telegram: true}, nil
+		case "2":
+			return selectedChannels{slack: true}, nil
+		case "3":
+			return selectedChannels{telegram: true, slack: true}, nil
+		default:
+			fmt.Fprintln(i.output, "Choose 1 for Telegram, 2 for Slack, or 3 for both Channels.")
+		}
+	}
+}
+
+func (i wizardInteraction) collectTelegramChatID() (int64, error) {
 	for {
 		value, err := i.prompt("Telegram forum group ID: ")
 		if err != nil {
@@ -157,7 +234,7 @@ func (i wizardInteraction) collectChatID() (int64, error) {
 	}
 }
 
-func (i wizardInteraction) collectAllowedUserIDs() ([]int64, error) {
+func (i wizardInteraction) collectTelegramAllowedUserIDs() ([]int64, error) {
 	for {
 		value, err := i.prompt("Allowed Telegram user IDs (comma-separated): ")
 		if err != nil {
@@ -187,9 +264,9 @@ func (i wizardInteraction) collectAllowedUserIDs() ([]int64, error) {
 	}
 }
 
-func (i wizardInteraction) collectToken(
+func (i wizardInteraction) collectTelegramToken(
 	ctx context.Context,
-	validator TokenValidator,
+	validator TelegramTokenValidator,
 ) (token string, fromEnvironment bool, err error) {
 	if value, ok := nonEmptyEnvironment(botTokenEnv); ok {
 		fmt.Fprintf(i.output, "Validating Telegram bot token from %s...\n", botTokenEnv)
@@ -213,6 +290,70 @@ func (i wizardInteraction) collectToken(
 			continue
 		}
 		return value, false, nil
+	}
+}
+
+func (i wizardInteraction) collectSlackToken(
+	ctx context.Context,
+	envName, question, label, prefix string,
+	validate func(context.Context, string) error,
+) (token string, fromEnvironment bool, err error) {
+	if value, ok := nonEmptyEnvironment(envName); ok {
+		fmt.Fprintf(i.output, "Validating %s from %s...\n", label, envName)
+		if !validSlackToken(value, prefix) {
+			return "", false, fmt.Errorf("%s is not a valid %s", envName, label)
+		}
+		if err := validate(ctx, value); err != nil {
+			return "", false, fmt.Errorf("%s is not a valid %s: %w", envName, label, err)
+		}
+		return value, true, nil
+	}
+
+	for {
+		value, err := i.prompt(question)
+		if err != nil {
+			return "", false, err
+		}
+		if !validSlackToken(value, prefix) {
+			fmt.Fprintf(i.output, "%s must start with %s and contain no spaces. Try again.\n", label, prefix)
+			continue
+		}
+		if err := validate(ctx, value); err != nil {
+			fmt.Fprintf(i.output, "%s rejected: %v. Try again.\n", label, err)
+			continue
+		}
+		return value, false, nil
+	}
+}
+
+func (i wizardInteraction) collectSlackChannelID() (string, error) {
+	for {
+		value, err := i.prompt("Slack channel ID: ")
+		if err != nil {
+			return "", err
+		}
+		if !validSlackChannelID(value) {
+			fmt.Fprintln(i.output, "A Slack channel ID must begin with C or G and contain no spaces.")
+			continue
+		}
+		return value, nil
+	}
+}
+
+func (i wizardInteraction) collectSlackAllowedUserIDs() ([]string, error) {
+	for {
+		value, err := i.prompt("Allowed Slack user IDs (comma-separated): ")
+		if err != nil {
+			return nil, err
+		}
+		userIDs := strings.FieldsFunc(value, func(r rune) bool {
+			return r == ',' || r == ' ' || r == '\t'
+		})
+		if validateSlackAllowedUserIDs(userIDs) != nil {
+			fmt.Fprintln(i.output, "Enter one or more unique Slack user IDs.")
+			continue
+		}
+		return userIDs, nil
 	}
 }
 
@@ -273,14 +414,6 @@ func (i wizardInteraction) collectValue(envName, question string) (string, error
 	}
 }
 
-func (i wizardInteraction) collectSecret(envName, question string) (value string, fromEnvironment bool, err error) {
-	if value, ok := nonEmptyEnvironment(envName); ok {
-		return value, true, nil
-	}
-	value, err = i.collectValue(envName, question)
-	return value, false, err
-}
-
 func (i wizardInteraction) prompt(question string) (string, error) {
 	fmt.Fprint(i.output, question)
 	line, err := i.reader.ReadString('\n')
@@ -322,6 +455,11 @@ func writeCommentedConfig(paths Paths, cfg Config) error {
 # loopback. bearer_token authenticates every endpoint except health. For
 # secret-managed deployments, leave it empty and set AETHOS_REST_BEARER_TOKEN.
 # AETHOS_REST_LISTEN_ADDRESS overrides the REST socket.
+# Slack app_token opens Socket Mode and bot_token authenticates Web API calls.
+# For secret-managed deployments, leave either token empty and set
+# AETHOS_SLACK_APP_TOKEN and AETHOS_SLACK_BOT_TOKEN instead. channel_id selects
+# the Slack channel whose top level is the Assistant; only the allowlisted
+# Slack user IDs may interact with aethos.
 # Telegram bot_token authenticates the Telegram Channel. For containers and
 # other secret-managed deployments, leave it empty and set
 # AETHOS_TELEGRAM_BOT_TOKEN instead. AETHOS_WORKSPACE and

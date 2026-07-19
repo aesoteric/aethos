@@ -354,12 +354,10 @@ allowed_user_ids = [123]
 func TestRunFirstRunWritesConfigAndRunsTelegramChannelAcrossRestart(t *testing.T) {
 	unsetEnv(t, "AETHOS_DATA_DIR")
 	unsetEnv(t, "AETHOS_TELEGRAM_BOT_TOKEN")
-	unsetEnv(t, "AETHOS_REST_BEARER_TOKEN")
-	unsetEnv(t, "AETHOS_REST_LISTEN_ADDRESS")
+	unsetEnv(t, "AETHOS_SLACK_APP_TOKEN")
+	unsetEnv(t, "AETHOS_SLACK_BOT_TOKEN")
 	unsetEnv(t, "AETHOS_WORKSPACE")
 	unsetEnv(t, "AETHOS_DEFAULT_AGENT")
-	t.Setenv("AETHOS_REST_BEARER_TOKEN", "rest-token")
-	t.Setenv("AETHOS_REST_LISTEN_ADDRESS", "127.0.0.1:0")
 
 	var callsMu sync.Mutex
 	var calls []string
@@ -394,7 +392,7 @@ func TestRunFirstRunWritesConfigAndRunsTelegramChannelAcrossRestart(t *testing.T
 	dataDir := filepath.Join(t.TempDir(), "data")
 	installCatalogAgent(t, dataDir)
 	workspace := t.TempDir()
-	input := strings.NewReader("valid-token\n-1001234567890\n123456789\n" + workspace + "\ncodex-acp\n")
+	input := strings.NewReader("1\nvalid-token\n-1001234567890\n123456789\n" + workspace + "\ncodex-acp\n")
 	var firstOutput strings.Builder
 	client := telegram.NewClient(server.URL, server.Client())
 

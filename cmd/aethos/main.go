@@ -167,9 +167,6 @@ func runApplication(
 			return err
 		}
 	case errors.Is(err, os.ErrNotExist):
-		if dependencies.telegram == nil {
-			return fmt.Errorf("start first-run setup: Telegram token validator is unavailable")
-		}
 		installed, installedErr := catalog.Installed()
 		if installedErr != nil {
 			return installedErr
@@ -183,7 +180,9 @@ func runApplication(
 				ID: installedAgent.ID, Name: installedAgent.Name, Type: string(installedAgent.Type),
 			})
 		}
-		configured, err = config.RunWizard(ctx, stdin, stdout, paths, dependencies.telegram, choices)
+		configured, err = config.RunWizard(
+			ctx, stdin, stdout, paths, dependencies.telegram, dependencies.slack, choices,
+		)
 		if err != nil {
 			return err
 		}

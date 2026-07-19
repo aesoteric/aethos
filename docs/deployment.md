@@ -1,9 +1,10 @@
 # Deployment
 
-Aethos needs outbound HTTPS access to Telegram, the ACP Agent registry, and the
-chosen Agent's provider. Keep its data directory and the Workspace on storage
-you back up. The SQLite database, configuration, installed Agent, Agent state,
-and Workspace are the only persistent state in the examples below.
+Aethos needs outbound HTTPS access to each configured Channel provider, the ACP
+Agent registry, and the chosen Agent's provider. Keep its data directory and the
+Workspace on storage you back up. The SQLite database, configuration, installed
+Agent, Agent state, and Workspace are the only persistent state in the examples
+below.
 
 ## Docker
 
@@ -108,6 +109,7 @@ sudoedit /etc/aethos/aethos.env
 ```
 
 Supported secret entries include `AETHOS_TELEGRAM_BOT_TOKEN`,
+`AETHOS_SLACK_APP_TOKEN`, `AETHOS_SLACK_BOT_TOKEN`,
 `AETHOS_REST_BEARER_TOKEN`, and provider variables required by the Agent.
 
 Verify and start the service:

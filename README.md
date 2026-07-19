@@ -58,9 +58,9 @@ aethos:
 aethos
 ```
 
-The first-run wizard validates the Telegram bot token and asks for the forum
-group, allowlisted users, Workspace, default Agent, and REST bearer token. At
-the end it writes `~/.aethos/config.toml` and starts the Telegram Channel.
+Choose Telegram in the first-run wizard. It validates the bot token and asks
+for the forum group, allowlisted users, Workspace, and default Agent. At the
+end it writes `~/.aethos/config.toml` and starts the Telegram Channel.
 
 In Telegram, open the Assistant Topic and send `/new`. Aethos creates a Session
 Topic; open it and send the first Prompt. The Agent's streamed output and any
@@ -74,6 +74,7 @@ credentials before accepting a release.
 ## What v0.1.0 includes
 
 - **Telegram**: each Session lives in its own forum Topic; agent output (thinking, tool calls, text) streams in as it happens; risky actions pause on approve/deny buttons.
+- **Slack**: each Session lives in a thread in one configured channel; the Assistant uses top-level messages and Session controls use buttons.
 - **REST/SSE**: automation clients create Sessions, send Prompts, and stream events with a bearer token.
 - **Sessions that survive restarts**: state in a single SQLite database; live Sessions demote to dormant on idle and auto-resume on the next Prompt.
 - **One config file**: commented TOML written by a first-run wizard, with env-var overrides for secrets.
@@ -82,7 +83,7 @@ credentials before accepting a release.
 ## Design
 
 - Go, cgo-free, statically cross-compiled.
-- Channels (user-facing: Telegram, REST/SSE) and Modules (internal features) are compiled in behind explicit seams — no runtime plugin system ([ADR-0002](docs/adr/0002-compiled-in-modules-no-plugin-system.md)).
+- Channels (user-facing: Telegram, Slack, REST/SSE) and Modules (internal features) are compiled in behind explicit seams — no runtime plugin system ([ADR-0002](docs/adr/0002-compiled-in-modules-no-plugin-system.md)).
 - The ACP SDK is quarantined in a single translation package; everything else consumes aethos-owned event types.
 - A new product in OpenACP's category, not a port ([ADR-0001](docs/adr/0001-new-product-not-a-port.md)).
 
@@ -114,12 +115,13 @@ verifies a published SHA-256 checksum when present and supports raw binaries,
 ## Configuration
 
 Install at least one Agent, then run `aethos` with no command. If `config.toml`
-does not exist, the first-run wizard validates the Telegram bot token with
-Telegram, collects the forum supergroup and allowlisted user IDs and a
-Workspace, offers the installed Agents for the default, then writes a commented
-configuration file and starts the Telegram Channel. Later starts load that file
-without prompting. `default_agent` stores an installed registry ID, not a shell
-command.
+does not exist, the first-run wizard asks whether to configure Telegram, Slack,
+or both and walks only the selected Channel sections. It validates Telegram and
+Slack tokens live, collects each Channel's destination and allowlisted user IDs,
+collects a Workspace, and offers the installed Agents for the default. It then
+writes a commented configuration file and starts the selected Channels. Later
+starts load that file without prompting. `default_agent` stores an installed
+registry ID, not a shell command.
 
 The Telegram group must be a supergroup with Topics enabled. Add the bot as an
 administrator with permission to manage Topics, then give the wizard the
@@ -144,6 +146,8 @@ Agent catalog, installed binaries, and log paths are all rooted there.
 Environment values override the file:
 
 - `AETHOS_TELEGRAM_BOT_TOKEN` (keeps the token out of `config.toml`)
+- `AETHOS_SLACK_APP_TOKEN` (keeps the Socket Mode token out of `config.toml`)
+- `AETHOS_SLACK_BOT_TOKEN` (keeps the bot token out of `config.toml`)
 - `AETHOS_REST_BEARER_TOKEN` (keeps the REST Channel token out of `config.toml`)
 - `AETHOS_REST_LISTEN_ADDRESS` (overrides the default `127.0.0.1:8080` socket)
 - `AETHOS_WORKSPACE`
