@@ -8,7 +8,7 @@ below.
 
 ## Slack Channel
 
-The Slack Channel uses Socket Mode, so Slack connects to aethos over an outbound
+The Slack Channel uses Socket Mode, so aethos connects to Slack over an outbound
 WebSocket and no public HTTP endpoint is required. One configured Slack channel
 hosts the Assistant at its top level and one Session Topic, implemented as a
 Slack thread, per Session.
@@ -63,9 +63,10 @@ Slack thread, per Session.
 }
 ```
 
-The history scopes and matching events let aethos receive Prompts from public
-and private Slack channels; `chat:write` lets it post and update its own output.
-See Slack's references for [`message.channels`](https://docs.slack.dev/reference/events/message.channels/),
+The history scopes and matching events let aethos receive Assistant input and
+Prompts from public and private Slack channels; `chat:write` lets it post and
+update its own output. See Slack's references for
+[`message.channels`](https://docs.slack.dev/reference/events/message.channels/),
 [`message.groups`](https://docs.slack.dev/reference/events/message.groups/),
 and [`chat:write`](https://docs.slack.dev/reference/scopes/chat.write/).
 Interactivity delivers Cancel and permission button presses over the same
@@ -216,26 +217,18 @@ sudo install -m 0755 aethos /usr/local/bin/aethos
 sudo install -m 0644 deploy/systemd/aethos.service /etc/systemd/system/aethos.service
 ```
 
-Install an Agent and run the wizard once as the service user. The example uses
-a binary Agent so it does not depend on a system Node.js installation:
+Install an Agent as the service user. The example uses a binary Agent so it does
+not depend on a system Node.js installation:
 
 ```sh
 sudo -u aethos env \
   HOME=/var/lib/aethos/home \
   AETHOS_DATA_DIR=/var/lib/aethos/data \
   /usr/local/bin/aethos agents install opencode
-
-sudo -u aethos env \
-  HOME=/var/lib/aethos/home \
-  AETHOS_DATA_DIR=/var/lib/aethos/data \
-  /usr/local/bin/aethos
 ```
 
-Enter `/var/lib/aethos/workspace` for the Workspace. Once the wizard has
-written the config and aethos has started, stop it with `Ctrl+C`.
-
-Secrets may instead live in `/etc/aethos/aethos.env`, which the unit loads when
-present. Use `NAME=value` lines and restrict the file to root:
+Put secrets in `/etc/aethos/aethos.env`, which the unit loads when present. Use
+`NAME=value` lines and restrict the file to root:
 
 ```sh
 sudo install -d -m 0755 /etc/aethos
@@ -246,6 +239,28 @@ sudoedit /etc/aethos/aethos.env
 Supported secret entries include `AETHOS_TELEGRAM_BOT_TOKEN`,
 `AETHOS_SLACK_APP_TOKEN`, `AETHOS_SLACK_BOT_TOKEN`,
 `AETHOS_REST_BEARER_TOKEN`, and provider variables required by the Agent.
+
+Run the wizard once as the service user. A direct command does not read the
+unit's `EnvironmentFile`, so first source it in a root shell and preserve only
+the named aethos token variables through `sudo`:
+
+```sh
+sudo -s
+set -a
+. /etc/aethos/aethos.env
+set +a
+sudo --preserve-env=AETHOS_TELEGRAM_BOT_TOKEN,AETHOS_SLACK_APP_TOKEN,AETHOS_SLACK_BOT_TOKEN \
+  -u aethos env \
+  HOME=/var/lib/aethos/home \
+  AETHOS_DATA_DIR=/var/lib/aethos/data \
+  /usr/local/bin/aethos
+exit
+```
+
+Enter `/var/lib/aethos/workspace` for the Workspace. Once the wizard has
+written the config and aethos has started, stop it with `Ctrl+C`, then leave the
+root shell with `exit`. The service reads the same secrets from the environment
+file on every later start.
 
 Verify and start the service:
 
