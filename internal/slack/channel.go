@@ -303,14 +303,14 @@ func (c *Channel) runConnection(ctx context.Context) error {
 				return fmt.Errorf("acknowledge Slack envelope %q: %w", envelope.EnvelopeID, err)
 			}
 		}
-		if envelope.Type == "disconnect" {
+		switch envelope.Type {
+		case "disconnect":
 			return fmt.Errorf("slack requested disconnect: %s", envelope.Reason)
-		}
-		if envelope.Type == "events_api" {
+		case "events_api":
 			if err := c.handleEvent(ctx, envelope.Payload); err != nil {
 				c.logger.Error("handle Slack event", "envelope_id", envelope.EnvelopeID, "error", err)
 			}
-		} else if envelope.Type == "interactive" {
+		case "interactive":
 			if err := c.handleInteraction(ctx, envelope.Payload); err != nil {
 				c.logger.Error("handle Slack interaction", "envelope_id", envelope.EnvelopeID, "error", err)
 			}
