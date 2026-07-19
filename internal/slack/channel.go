@@ -95,6 +95,7 @@ type Channel struct {
 
 	mu            sync.Mutex
 	sessions      sessionTarget
+	runCtx        context.Context
 	lanes         map[string]chan inboundPrompt
 	drafts        map[string]*messageDraft
 	permissions   map[string]*permissionMessage
@@ -118,6 +119,7 @@ type messageDraft struct {
 	chunks      []draftChunk
 	lastKind    fragmentKind
 	cancelValue string
+	placeholder bool
 	running     bool
 	dirty       bool
 	updated     chan struct{}
@@ -216,12 +218,14 @@ func (c *Channel) Run(ctx context.Context, sessions sessionTarget) error {
 	}
 	c.running = true
 	c.sessions = sessions
+	c.runCtx = runCtx
 	c.mu.Unlock()
 	defer func() {
 		cancel()
 		c.workers.Wait()
 		c.mu.Lock()
 		c.running = false
+		c.runCtx = nil
 		c.mu.Unlock()
 	}()
 
@@ -604,11 +608,10 @@ func (c *Channel) SendLifecycle(ctx context.Context, event channeltypes.Lifecycl
 			ctx, c.settings.BotToken, c.settings.ChannelID, record.TopicKey, rootText(record),
 		)
 	case channeltypes.PromptStarted:
-		c.beginDraft(sessionThread{sessionID: record.ID, threadTS: record.TopicKey})
-		_, err := c.client.PostMessage(
-			ctx, c.settings.BotToken, c.settings.ChannelID, record.TopicKey, "Prompt started.",
+		return c.beginDraft(
+			ctx,
+			sessionThread{sessionID: record.ID, threadTS: record.TopicKey},
 		)
-		return err
 	case channeltypes.PromptFinished:
 		flushErr := c.waitForDraft(ctx, record.ID)
 		c.finishDraft(record.ID)
@@ -636,14 +639,42 @@ func (c *Channel) sessionRecord(ctx context.Context, sessionID string) (session.
 	return sessions.Get(ctx, sessionID)
 }
 
-func (c *Channel) beginDraft(destination sessionThread) {
+func (c *Channel) beginDraft(ctx context.Context, destination sessionThread) error {
 	c.mu.Lock()
-	c.nextControlID++
-	c.drafts[destination.sessionID] = newMessageDraft(
-		destination,
-		fmt.Sprintf("%s:%d", destination.sessionID, c.nextControlID),
-	)
+	draft := c.newDraftLocked(destination)
+	c.drafts[destination.sessionID] = draft
 	c.mu.Unlock()
+
+	const text = "Prompt started."
+	blocks := draftBlocks(text, true, draft.cancelValue)
+	posted, err := c.client.postMessage(
+		ctx,
+		c.settings.BotToken,
+		c.settings.ChannelID,
+		destination.threadTS,
+		text,
+		&blocks,
+	)
+	if err != nil {
+		c.mu.Lock()
+		if c.drafts[destination.sessionID] == draft {
+			delete(c.drafts, destination.sessionID)
+		}
+		c.mu.Unlock()
+		return err
+	}
+	c.mu.Lock()
+	if c.drafts[destination.sessionID] == draft {
+		draft.chunks = []draftChunk{{
+			text:          text,
+			messageTS:     posted.TS,
+			lastSentText:  text,
+			cancelVisible: true,
+		}}
+		draft.placeholder = true
+	}
+	c.mu.Unlock()
+	return nil
 }
 
 func newMessageDraft(destination sessionThread, cancelValue string) *messageDraft {
@@ -655,16 +686,25 @@ func newMessageDraft(destination sessionThread, cancelValue string) *messageDraf
 	}
 }
 
+func (c *Channel) newDraftLocked(destination sessionThread) *messageDraft {
+	c.nextControlID++
+	return newMessageDraft(
+		destination,
+		fmt.Sprintf("%s:%d", destination.sessionID, c.nextControlID),
+	)
+}
+
 func (c *Channel) appendDraft(destination sessionThread, fragment eventFragment) {
 	c.mu.Lock()
 	draft := c.drafts[destination.sessionID]
 	if draft == nil {
-		c.nextControlID++
-		draft = newMessageDraft(
-			destination,
-			fmt.Sprintf("%s:%d", destination.sessionID, c.nextControlID),
-		)
+		draft = c.newDraftLocked(destination)
 		c.drafts[destination.sessionID] = draft
+	}
+	if draft.placeholder {
+		draft.chunks = append(draft.chunks, draftChunk{})
+		draft.lastKind = 0
+		draft.placeholder = false
 	}
 	continuous := fragment.kind == draft.lastKind &&
 		(fragment.kind == thoughtFragment || fragment.kind == messageFragment)
@@ -723,6 +763,9 @@ type draftWrite struct {
 }
 
 func (c *Channel) flushOne(ctx context.Context) {
+	if c.flushOnePermission(ctx) {
+		return
+	}
 	write, ok := c.nextDraftWrite()
 	if !ok {
 		return

@@ -473,6 +473,48 @@ func TestSlackFlowCancelButtonStopsInflightPromptAndDisappears(t *testing.T) {
 	flow.stop()
 }
 
+func TestSlackFlowCancelButtonIsAvailableBeforeAgentOutput(t *testing.T) {
+	started := make(chan struct{}, 1)
+	neverContinue := make(chan struct{})
+	script := agent.Script{Turns: []agent.Turn{{
+		WantPrompt: "work silently",
+		Started:    started,
+		Continue:   neverContinue,
+		Stop:       agent.StopEndTurn,
+	}}}
+	flow := startOneSlackSessionFlow(t, &script)
+	flow.api.sendEnvelope(messageEnvelope(
+		"prompt-envelope", "U0123456789", "C0123456789", "work silently", flow.threadTS,
+	))
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Slack Prompt did not reach the scripted Agent")
+	}
+	draftTS, cancelValue := flow.api.threadButton(flow.threadTS, "Prompt started.", "Cancel")
+	if draftTS == "" || cancelValue == "" {
+		t.Fatal("Slack draft did not expose Cancel before Agent output")
+	}
+	flow.api.sendEnvelope(blockActionEnvelope(
+		"cancel-envelope",
+		"U0123456789",
+		"C0123456789",
+		draftTS,
+		flow.threadTS,
+		"cancel_prompt",
+		cancelValue,
+	))
+
+	waitFor(t, func() bool {
+		return flow.api.hasAcknowledgement("cancel-envelope") &&
+			flow.api.hasThreadPost(flow.threadTS, "Prompt cancelled.") &&
+			flow.api.hasUpdateWithoutButtons(draftTS, "Prompt started.")
+	})
+
+	flow.stop()
+}
+
 func TestSlackFlowCancelButtonAnswersWhenPromptJustFinished(t *testing.T) {
 	script := agent.Script{Turns: []agent.Turn{{
 		WantPrompt: "finish quickly",
@@ -533,16 +575,14 @@ func TestSlackFlowPermissionButtonsResolveRequestAndShowDecision(t *testing.T) {
 	))
 
 	const permissionText = "Permission requested: Update config.toml\nKind: edit"
-	var permissionTS, approveValue string
+	var permissionTS, approveValue, denyValue string
 	waitFor(t, func() bool {
 		permissionTS, approveValue = flow.api.threadButton(
 			flow.threadTS, permissionText, "Approve",
 		)
-		return permissionTS != "" && approveValue != ""
+		_, denyValue = flow.api.threadButton(flow.threadTS, permissionText, "Deny")
+		return permissionTS != "" && approveValue != "" && denyValue != ""
 	})
-	if _, denyValue := flow.api.threadButton(flow.threadTS, permissionText, "Deny"); denyValue == "" {
-		t.Fatal("Slack permission request did not include a Deny button")
-	}
 	flow.api.sendEnvelope(blockActionEnvelope(
 		"approve-envelope",
 		"U0123456789",
@@ -552,9 +592,19 @@ func TestSlackFlowPermissionButtonsResolveRequestAndShowDecision(t *testing.T) {
 		"resolve_permission",
 		approveValue,
 	))
+	flow.api.sendEnvelope(blockActionEnvelope(
+		"stale-deny-envelope",
+		"U0123456789",
+		"C0123456789",
+		permissionTS,
+		flow.threadTS,
+		"resolve_permission",
+		denyValue,
+	))
 
 	waitFor(t, func() bool {
 		return flow.api.hasAcknowledgement("approve-envelope") &&
+			flow.api.hasAcknowledgement("stale-deny-envelope") &&
 			flow.api.hasUpdateWithoutButtons(
 				permissionTS, permissionText+"\nOutcome: Approved",
 			) &&
@@ -583,6 +633,8 @@ func TestSlackFlowPermissionTimeoutRemovesButtonsAndShowsOutcome(t *testing.T) {
 		Stop:   agent.StopEndTurn,
 	}}}
 	flow := startOneSlackSessionFlow(t, &script, session.WithPermissionTimeout(25*time.Millisecond))
+	flow.api.delayPermissionPosts(75 * time.Millisecond)
+	flow.api.failPermissionUpdates(1)
 	flow.api.sendEnvelope(messageEnvelope(
 		"prompt-envelope", "U0123456789", "C0123456789", "update the config", flow.threadTS,
 	))
@@ -596,7 +648,9 @@ func TestSlackFlowPermissionTimeoutRemovesButtonsAndShowsOutcome(t *testing.T) {
 	waitFor(t, func() bool {
 		return flow.api.hasUpdateWithoutButtons(
 			permissionTS, permissionText+"\nOutcome: Timed out — denied",
-		) && flow.api.hasThreadPost(flow.threadTS, "continued after denial")
+		) && flow.api.permissionUpdateCount(
+			permissionTS, permissionText+"\nOutcome: Timed out — denied",
+		) >= 2 && flow.api.hasThreadPost(flow.threadTS, "continued after denial")
 	})
 
 	flow.stop()

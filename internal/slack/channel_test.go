@@ -284,13 +284,15 @@ type slackCall struct {
 type slackFixtureAPI struct {
 	server *httptest.Server
 
-	mu               sync.Mutex
-	scripts          []socketScript
-	envelopes        chan string
-	calls            []slackCall
-	acknowledgements []string
-	connections      int
-	nextMessage      int
+	mu                       sync.Mutex
+	scripts                  []socketScript
+	envelopes                chan string
+	calls                    []slackCall
+	acknowledgements         []string
+	connections              int
+	nextMessage              int
+	permissionPostDelay      time.Duration
+	permissionUpdateFailures int
 }
 
 func newSlackFixtureAPI(t *testing.T, scripts ...socketScript) *slackFixtureAPI {
@@ -324,8 +326,36 @@ func (a *slackFixtureAPI) handle(w http.ResponseWriter, r *http.Request) {
 	a.calls = append(a.calls, slackCall{
 		method: method, authorization: r.Header.Get("Authorization"), body: body, responseTS: responseTS, at: time.Now(),
 	})
+	bodyText, _ := body["text"].(string)
+	postDelay := time.Duration(0)
+	if method == "chat.postMessage" && strings.HasPrefix(bodyText, "Permission requested:") {
+		postDelay = a.permissionPostDelay
+	}
+	failUpdate := false
+	if method == "chat.update" && strings.Contains(bodyText, "\nOutcome:") && a.permissionUpdateFailures > 0 {
+		a.permissionUpdateFailures--
+		failUpdate = true
+	}
 	a.mu.Unlock()
+	if postDelay > 0 {
+		timer := time.NewTimer(postDelay)
+		select {
+		case <-timer.C:
+		case <-r.Context().Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return
+		}
+	}
 	w.Header().Set("Content-Type", "application/json")
+	if failUpdate {
+		fmt.Fprint(w, `{"ok":false,"error":"ratelimited"}`)
+		return
+	}
 	switch method {
 	case "auth.test":
 		fmt.Fprint(w, `{"ok":true,"team_id":"T0123456789","user_id":"U0AETHOS000","bot_id":"B0AETHOS000"}`)
@@ -408,6 +438,18 @@ func (a *slackFixtureAPI) writeEnvelope(
 
 func (a *slackFixtureAPI) sendEnvelope(envelope string) {
 	a.envelopes <- envelope
+}
+
+func (a *slackFixtureAPI) delayPermissionPosts(delay time.Duration) {
+	a.mu.Lock()
+	a.permissionPostDelay = delay
+	a.mu.Unlock()
+}
+
+func (a *slackFixtureAPI) failPermissionUpdates(count int) {
+	a.mu.Lock()
+	a.permissionUpdateFailures = count
+	a.mu.Unlock()
 }
 
 func (a *slackFixtureAPI) hasAcknowledgement(envelopeID string) bool {
@@ -539,6 +581,18 @@ func (a *slackFixtureAPI) hasUpdateWithoutButtons(timestamp, text string) bool {
 		}
 	}
 	return false
+}
+
+func (a *slackFixtureAPI) permissionUpdateCount(timestamp, text string) int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	count := 0
+	for _, call := range a.calls {
+		if call.method == "chat.update" && call.body["ts"] == timestamp && call.body["text"] == text {
+			count++
+		}
+	}
+	return count
 }
 
 func buttonValue(rawBlocks any, label string) string {

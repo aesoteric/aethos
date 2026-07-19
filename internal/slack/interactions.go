@@ -18,16 +18,30 @@ const (
 	cancelPromptActionID         = "cancel_prompt"
 	resolvePermissionActionID    = "resolve_permission"
 	completedPermissionRetention = 10 * time.Minute
+	minimumPermissionRetryDelay  = 25 * time.Millisecond
+	maximumPermissionRetryDelay  = 30 * time.Second
 )
 
 type permissionMessage struct {
-	messageTS   string
-	threadTS    string
-	text        string
-	options     []agent.PermissionOption
-	values      []string
-	answering   bool
-	completedAt time.Time
+	messageTS     string
+	threadTS      string
+	text          string
+	options       []agent.PermissionOption
+	controlValues []string
+	answering     bool
+	outcomeText   string
+	dirty         bool
+	writing       bool
+	retryAt       time.Time
+	retryDelay    time.Duration
+	completedAt   time.Time
+}
+
+type permissionWrite struct {
+	requestID string
+	pending   *permissionMessage
+	messageTS string
+	text      string
 }
 
 type blockActionPayload struct {
@@ -84,13 +98,13 @@ func (c *Channel) resolvePermission(ctx context.Context, messageTS, threadTS, co
 	var requestID, optionID string
 	var pending *permissionMessage
 	for id, permission := range c.permissions {
-		if permission.threadTS != threadTS || permission.answering || !permission.completedAt.IsZero() {
+		if permission.threadTS != threadTS || permission.answering || permission.outcomeText != "" {
 			continue
 		}
 		if permission.messageTS != "" && permission.messageTS != messageTS {
 			continue
 		}
-		for index, value := range permission.values {
+		for index, value := range permission.controlValues {
 			if value == controlValue {
 				requestID = id
 				optionID = permission.options[index].ID
@@ -133,6 +147,10 @@ func (c *Channel) presentPermission(
 	text := permissionRequestText(request.Title, request.Kind)
 
 	c.mu.Lock()
+	postCtx := c.runCtx
+	if postCtx == nil {
+		postCtx = ctx
+	}
 	for id, permission := range c.permissions {
 		if !permission.completedAt.IsZero() && time.Since(permission.completedAt) >= completedPermissionRetention {
 			delete(c.permissions, id)
@@ -140,11 +158,11 @@ func (c *Channel) presentPermission(
 	}
 	c.nextControlID++
 	controlID := c.nextControlID
-	values := make([]string, len(request.Options))
+	controlValues := make([]string, len(request.Options))
 	buttons := make([]blockElement, 0, len(request.Options))
 	for index, option := range request.Options {
 		value := fmt.Sprintf("permission:%d:%d", controlID, index)
-		values[index] = value
+		controlValues[index] = value
 		presentation := permissionPresentation(option.Kind)
 		buttons = append(buttons, button(
 			permissionButtonLabel(option),
@@ -154,17 +172,17 @@ func (c *Channel) presentPermission(
 		))
 	}
 	pending := &permissionMessage{
-		threadTS: threadTS,
-		text:     text,
-		options:  append([]agent.PermissionOption(nil), request.Options...),
-		values:   values,
+		threadTS:      threadTS,
+		text:          text,
+		options:       append([]agent.PermissionOption(nil), request.Options...),
+		controlValues: controlValues,
 	}
 	c.permissions[request.ID] = pending
 	c.mu.Unlock()
 
 	blocks := interactiveMessageBlocks(text, buttons...)
 	posted, err := c.client.postMessage(
-		ctx,
+		postCtx,
 		c.settings.BotToken,
 		c.settings.ChannelID,
 		threadTS,
@@ -182,35 +200,88 @@ func (c *Channel) presentPermission(
 	c.mu.Lock()
 	if c.permissions[request.ID] == pending {
 		pending.messageTS = posted.TS
+		pending.dirty = pending.outcomeText != ""
 	}
 	c.mu.Unlock()
 	return nil
 }
 
 func (c *Channel) finishPermission(ctx context.Context, result agent.PermissionResolved) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	pending := c.permissions[result.ID]
-	if pending == nil || !pending.completedAt.IsZero() {
-		c.mu.Unlock()
+	if pending == nil || pending.outcomeText != "" {
 		return nil
 	}
-	pending.completedAt = time.Now()
 	pending.answering = false
-	messageTS := pending.messageTS
-	text := pending.text + "\nOutcome: " + permissionOutcome(result, pending.options)
-	c.mu.Unlock()
-	if messageTS == "" {
-		return fmt.Errorf("permission request %q has no Slack message timestamp", result.ID)
+	pending.outcomeText = pending.text + "\nOutcome: " + permissionOutcome(result, pending.options)
+	pending.dirty = pending.messageTS != ""
+	return nil
+}
+
+func (c *Channel) flushOnePermission(ctx context.Context) bool {
+	write, ok := c.nextPermissionWrite(time.Now())
+	if !ok {
+		return false
 	}
 	emptyBlocks := []messageBlock{}
-	return c.client.updateMessage(
+	err := c.client.updateMessage(
 		ctx,
 		c.settings.BotToken,
 		c.settings.ChannelID,
-		messageTS,
-		text,
+		write.messageTS,
+		write.text,
 		&emptyBlocks,
 	)
+	c.mu.Lock()
+	current := c.permissions[write.requestID]
+	if current == write.pending {
+		current.writing = false
+		if err == nil {
+			current.dirty = false
+			current.completedAt = time.Now()
+			current.retryAt = time.Time{}
+			current.retryDelay = 0
+		} else {
+			current.dirty = true
+			if current.retryDelay == 0 {
+				current.retryDelay = max(c.options.writeInterval*2, minimumPermissionRetryDelay)
+			} else {
+				current.retryDelay = min(current.retryDelay*2, maximumPermissionRetryDelay)
+			}
+			current.retryAt = time.Now().Add(current.retryDelay)
+		}
+	}
+	c.mu.Unlock()
+	if err != nil {
+		c.logger.Warn(
+			"update Slack permission outcome",
+			"request", write.requestID,
+			"error", err,
+		)
+	}
+	return true
+}
+
+func (c *Channel) nextPermissionWrite(now time.Time) (permissionWrite, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for requestID, pending := range c.permissions {
+		if !pending.dirty || pending.writing || pending.messageTS == "" || pending.retryAt.After(now) {
+			continue
+		}
+		pending.writing = true
+		return permissionWrite{
+			requestID: requestID,
+			pending:   pending,
+			messageTS: pending.messageTS,
+			text:      pending.outcomeText,
+		}, true
+	}
+	return permissionWrite{}, false
 }
 
 func permissionRequestText(title, kind string) string {
