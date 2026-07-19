@@ -136,14 +136,24 @@ func TestSlackFlowListsEverySessionFromAssistant(t *testing.T) {
 
 	stop := startSlackFlow(t, bridge, manager)
 
-	waitFor(t, func() bool { return api.hasPost("C0123456789", "Sessions:") })
-	records, err := manager.List(t.Context())
-	if err != nil {
-		t.Fatalf("list Slack Sessions: %v", err)
-	}
-	if len(records) != 2 {
-		t.Fatalf("listed Sessions = %d, want 2", len(records))
-	}
+	var records []session.Record
+	waitFor(t, func() bool {
+		var err error
+		records, err = manager.List(t.Context())
+		return err == nil && len(records) == 2
+	})
+	waitFor(t, func() bool {
+		if !api.hasPost("C0123456789", "Sessions:") {
+			return false
+		}
+		for _, record := range records {
+			want := record.ID + "\nState: live\nAgent: " + string(record.Agent) + "\nName: (unnamed)"
+			if !api.hasPost("C0123456789", want) {
+				return false
+			}
+		}
+		return true
+	})
 	for _, record := range records {
 		want := record.ID + "\nState: live\nAgent: " + string(record.Agent) + "\nName: (unnamed)"
 		if !api.hasPost("C0123456789", want) {
@@ -155,35 +165,17 @@ func TestSlackFlowListsEverySessionFromAssistant(t *testing.T) {
 }
 
 func TestSlackFlowClosesSessionFromAssistant(t *testing.T) {
-	workspace := t.TempDir()
-	const threadTS = "1750000001.000001"
-	api := newSlackFixtureAPI(t, socketScript{envelopes: []string{
-		`{"type":"hello","connection_info":{"app_id":"A0123456789"}}`,
-		messageEnvelope("new-envelope", "U0123456789", "C0123456789", "new", ""),
-	}})
-	bridge := newSlackChannelWithDefaults(t, api, workspace)
-	manager := openSlackSessionManager(t, bridge, &agent.Script{})
-
-	stop := startSlackFlow(t, bridge, manager)
-
-	var record session.Record
-	waitFor(t, func() bool {
-		records, err := manager.List(t.Context())
-		if err != nil || len(records) != 1 || !api.hasThreadPost(threadTS, "Session ready. Send a Prompt in this thread.") {
-			return false
-		}
-		record = records[0]
-		return true
-	})
-	api.sendEnvelope(messageEnvelope(
-		"close-envelope", "U0123456789", "C0123456789", "close "+record.ID, "",
+	flow := startOneSlackSessionFlow(t, &agent.Script{})
+	flow.api.sendEnvelope(messageEnvelope(
+		"close-envelope", "U0123456789", "C0123456789", "close "+flow.record.ID, "",
 	))
 
 	waitFor(t, func() bool {
-		return api.hasPost("C0123456789", "Session closed: "+record.ID+" ("+record.ID+").") &&
-			api.hasUpdate(threadTS, "New Session\nState: closed")
+		return flow.api.hasPost(
+			"C0123456789", "Session closed: "+flow.record.ID+" ("+flow.record.ID+").",
+		) && flow.api.hasUpdate(flow.threadTS, "New Session\nState: closed")
 	})
-	closed, err := manager.Get(t.Context(), record.ID)
+	closed, err := flow.manager.Get(t.Context(), flow.record.ID)
 	if err != nil {
 		t.Fatalf("get closed Slack Session: %v", err)
 	}
@@ -191,7 +183,7 @@ func TestSlackFlowClosesSessionFromAssistant(t *testing.T) {
 		t.Errorf("closed Session state = %q, want %q", closed.State, session.Closed)
 	}
 
-	stop()
+	flow.stop()
 }
 
 func TestSlackFlowAnswersCloseForMissingSession(t *testing.T) {
@@ -229,82 +221,49 @@ func TestSlackFlowAnswersCloseWithoutSessionID(t *testing.T) {
 }
 
 func TestSlackFlowAnswersCloseForAlreadyClosedSession(t *testing.T) {
-	workspace := t.TempDir()
-	api := newSlackFixtureAPI(t, socketScript{envelopes: []string{
-		`{"type":"hello","connection_info":{"app_id":"A0123456789"}}`,
-		messageEnvelope("new-envelope", "U0123456789", "C0123456789", "new", ""),
-	}})
-	bridge := newSlackChannelWithDefaults(t, api, workspace)
-	manager := openSlackSessionManager(t, bridge, &agent.Script{})
-
-	stop := startSlackFlow(t, bridge, manager)
-
-	var record session.Record
-	waitFor(t, func() bool {
-		records, err := manager.List(t.Context())
-		if err != nil || len(records) != 1 {
-			return false
-		}
-		record = records[0]
-		return true
-	})
-	api.sendEnvelope(messageEnvelope(
-		"first-close-envelope", "U0123456789", "C0123456789", "close "+record.ID, "",
+	flow := startOneSlackSessionFlow(t, &agent.Script{})
+	flow.api.sendEnvelope(messageEnvelope(
+		"first-close-envelope", "U0123456789", "C0123456789", "close "+flow.record.ID, "",
 	))
 	waitFor(t, func() bool {
-		return api.hasPost("C0123456789", "Session closed: "+record.ID+" ("+record.ID+").")
+		return flow.api.hasPost(
+			"C0123456789", "Session closed: "+flow.record.ID+" ("+flow.record.ID+").",
+		)
 	})
-	api.sendEnvelope(messageEnvelope(
-		"second-close-envelope", "U0123456789", "C0123456789", "close "+record.ID, "",
+	flow.api.sendEnvelope(messageEnvelope(
+		"second-close-envelope", "U0123456789", "C0123456789", "close "+flow.record.ID, "",
 	))
 
 	waitFor(t, func() bool {
-		return api.hasPost("C0123456789", "Session is already closed: "+record.ID)
+		return flow.api.hasPost("C0123456789", "Session is already closed: "+flow.record.ID)
 	})
 
-	stop()
+	flow.stop()
 }
 
 func TestSlackFlowAnswersPromptInClosedSessionWithoutDispatch(t *testing.T) {
-	workspace := t.TempDir()
 	dispatched := make(chan struct{}, 1)
 	script := agent.Script{Turns: []agent.Turn{{
 		WantPrompt: "do not dispatch",
 		Started:    dispatched,
 		Stop:       agent.StopEndTurn,
 	}}}
-	const threadTS = "1750000001.000001"
-	api := newSlackFixtureAPI(t, socketScript{envelopes: []string{
-		`{"type":"hello","connection_info":{"app_id":"A0123456789"}}`,
-		messageEnvelope("new-envelope", "U0123456789", "C0123456789", "new", ""),
-	}})
-	bridge := newSlackChannelWithDefaults(t, api, workspace)
-	manager := openSlackSessionManager(t, bridge, &script)
-
-	stop := startSlackFlow(t, bridge, manager)
-
-	var record session.Record
-	waitFor(t, func() bool {
-		records, err := manager.List(t.Context())
-		if err != nil || len(records) != 1 {
-			return false
-		}
-		record = records[0]
-		return true
-	})
-	api.sendEnvelope(messageEnvelope(
-		"close-envelope", "U0123456789", "C0123456789", "close "+record.ID, "",
+	flow := startOneSlackSessionFlow(t, &script)
+	flow.api.sendEnvelope(messageEnvelope(
+		"close-envelope", "U0123456789", "C0123456789", "close "+flow.record.ID, "",
 	))
 	waitFor(t, func() bool {
-		closed, err := manager.Get(t.Context(), record.ID)
+		closed, err := flow.manager.Get(t.Context(), flow.record.ID)
 		return err == nil && closed.State == session.Closed
 	})
-	api.sendEnvelope(messageEnvelope(
-		"closed-prompt-envelope", "U0123456789", "C0123456789", "do not dispatch", threadTS,
+	flow.api.sendEnvelope(messageEnvelope(
+		"closed-prompt-envelope", "U0123456789", "C0123456789", "do not dispatch", flow.threadTS,
 	))
 
 	waitFor(t, func() bool {
-		return api.hasThreadPost(threadTS, "This Session is closed. Start a new Session to continue.")
+		return flow.api.hasThreadPost(
+			flow.threadTS, "This Session is closed. Start a new Session to continue.",
+		)
 	})
 	select {
 	case <-dispatched:
@@ -312,75 +271,53 @@ func TestSlackFlowAnswersPromptInClosedSessionWithoutDispatch(t *testing.T) {
 	default:
 	}
 
-	stop()
+	flow.stop()
 }
 
 func TestSlackFlowResumesDormantSessionAndSurfacesState(t *testing.T) {
-	workspace := t.TempDir()
 	script := agent.Script{Turns: []agent.Turn{{
 		WantPrompt: "resume work",
 		Events:     []agent.Event{agent.Message{Text: "resumed"}},
 		Stop:       agent.StopEndTurn,
 	}}}
-	const threadTS = "1750000001.000001"
-	api := newSlackFixtureAPI(t, socketScript{envelopes: []string{
-		`{"type":"hello","connection_info":{"app_id":"A0123456789"}}`,
-		messageEnvelope("new-envelope", "U0123456789", "C0123456789", "new", ""),
-	}})
-	bridge := newSlackChannelWithDefaults(t, api, workspace, slack.WithWriteInterval(5*time.Millisecond))
-	manager := openSlackSessionManager(t, bridge, &script, session.WithIdleTimeout(250*time.Millisecond))
-
-	stop := startSlackFlow(t, bridge, manager)
-
-	var record session.Record
+	flow := startOneSlackSessionFlow(t, &script, session.WithIdleTimeout(250*time.Millisecond))
 	waitFor(t, func() bool {
-		records, err := manager.List(t.Context())
-		if err != nil || len(records) != 1 {
-			return false
-		}
-		record = records[0]
-		return record.State == session.Dormant && api.hasUpdate(threadTS, "New Session\nState: dormant")
+		record, err := flow.manager.Get(t.Context(), flow.record.ID)
+		return err == nil && record.State == session.Dormant &&
+			flow.api.hasUpdate(flow.threadTS, "New Session\nState: dormant")
 	})
-	api.sendEnvelope(messageEnvelope(
-		"resume-envelope", "U0123456789", "C0123456789", "resume work", threadTS,
+	flow.api.sendEnvelope(messageEnvelope(
+		"resume-envelope", "U0123456789", "C0123456789", "resume work", flow.threadTS,
 	))
 
 	waitFor(t, func() bool {
-		resumed, err := manager.Get(t.Context(), record.ID)
+		resumed, err := flow.manager.Get(t.Context(), flow.record.ID)
 		return err == nil && resumed.State == session.Live &&
-			api.hasUpdate(threadTS, "resume work\nState: live") &&
-			api.hasThreadPost(threadTS, "resumed") &&
-			api.hasThreadPost(threadTS, "Prompt finished: end_turn.")
+			flow.api.hasUpdate(flow.threadTS, "resume work\nState: live") &&
+			flow.api.hasThreadPost(flow.threadTS, "resumed") &&
+			flow.api.hasThreadPost(flow.threadTS, "Prompt finished: end_turn.")
 	})
 
-	stop()
+	flow.stop()
 }
 
 func TestSlackFlowAppliesAgentDrivenSessionRenameToRoot(t *testing.T) {
-	workspace := t.TempDir()
 	script := agent.Script{Turns: []agent.Turn{{
 		WantPrompt: "inspect authentication",
-		Events:     []agent.Event{agent.SessionInfoUpdated{Title: "Review auth flow"}},
+		Events:     []agent.Event{agent.SessionRenamed{Name: "Review auth flow"}},
 		Stop:       agent.StopEndTurn,
 	}}}
-	const threadTS = "1750000001.000001"
-	api := newSlackFixtureAPI(t, socketScript{envelopes: []string{
-		`{"type":"hello","connection_info":{"app_id":"A0123456789"}}`,
-		messageEnvelope("new-envelope", "U0123456789", "C0123456789", "new", ""),
-		messageEnvelope("prompt-envelope", "U0123456789", "C0123456789", "inspect authentication", threadTS),
-	}})
-	bridge := newSlackChannelWithDefaults(t, api, workspace, slack.WithWriteInterval(5*time.Millisecond))
-	manager := openSlackSessionManager(t, bridge, &script)
-
-	stop := startSlackFlow(t, bridge, manager)
-
+	flow := startOneSlackSessionFlow(t, &script)
+	flow.api.sendEnvelope(messageEnvelope(
+		"prompt-envelope", "U0123456789", "C0123456789", "inspect authentication", flow.threadTS,
+	))
 	waitFor(t, func() bool {
-		records, err := manager.List(t.Context())
+		records, err := flow.manager.List(t.Context())
 		return err == nil && len(records) == 1 && records[0].Name == "Review auth flow" &&
-			api.hasUpdate(threadTS, "Review auth flow\nState: live")
+			flow.api.hasUpdate(flow.threadTS, "Review auth flow\nState: live")
 	})
 
-	stop()
+	flow.stop()
 }
 
 func TestSlackFlowDispatchesThreadPromptsSerially(t *testing.T) {
@@ -502,6 +439,46 @@ func TestSlackFlowSurfacesPromptFinishedError(t *testing.T) {
 	})
 
 	stop()
+}
+
+type slackSessionFlow struct {
+	api      *slackFixtureAPI
+	manager  *session.Manager
+	record   session.Record
+	threadTS string
+	stop     func()
+}
+
+func startOneSlackSessionFlow(
+	t *testing.T,
+	script *agent.Script,
+	options ...session.Option,
+) slackSessionFlow {
+	t.Helper()
+	const threadTS = "1750000001.000001"
+	api := newSlackFixtureAPI(t, socketScript{envelopes: []string{
+		`{"type":"hello","connection_info":{"app_id":"A0123456789"}}`,
+		messageEnvelope("new-envelope", "U0123456789", "C0123456789", "new", ""),
+	}})
+	bridge := newSlackChannelWithDefaults(
+		t, api, t.TempDir(), slack.WithWriteInterval(5*time.Millisecond),
+	)
+	manager := openSlackSessionManager(t, bridge, script, options...)
+	stop := startSlackFlow(t, bridge, manager)
+
+	var record session.Record
+	waitFor(t, func() bool {
+		records, err := manager.List(t.Context())
+		if err != nil || len(records) != 1 ||
+			!api.hasThreadPost(threadTS, "Session ready. Send a Prompt in this thread.") {
+			return false
+		}
+		record = records[0]
+		return true
+	})
+	return slackSessionFlow{
+		api: api, manager: manager, record: record, threadTS: threadTS, stop: stop,
+	}
 }
 
 func startSlackFlow(t *testing.T, bridge *slack.Channel, manager *session.Manager) func() {

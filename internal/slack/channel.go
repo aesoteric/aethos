@@ -551,8 +551,8 @@ func (c *Channel) Send(ctx context.Context, event channeltypes.Event) error {
 	if record.Owner.Channel != channelName || record.TopicKey == "" {
 		return nil
 	}
-	if update, ok := event.AgentEvent.(agent.SessionInfoUpdated); ok {
-		record, err = c.sessions.Rename(ctx, record.ID, update.Title)
+	if renamed, ok := event.AgentEvent.(agent.SessionRenamed); ok {
+		record, err = c.sessions.Rename(ctx, record.ID, renamed.Name)
 		if err != nil {
 			return err
 		}

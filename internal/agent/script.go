@@ -355,10 +355,10 @@ func untranslate(ev Event) sdk.SessionUpdate {
 		return sdk.UpdateAgentThoughtText(e.Text)
 	case Message:
 		return sdk.UpdateAgentMessageText(e.Text)
-	case SessionInfoUpdated:
+	case SessionRenamed:
 		return sdk.SessionUpdate{SessionInfoUpdate: &sdk.SessionSessionInfoUpdate{
 			SessionUpdate: "session_info_update",
-			Title:         sdk.Ptr(e.Title),
+			Title:         sdk.Ptr(e.Name),
 		}}
 	case ToolCallBegan:
 		var opts []sdk.ToolCallStartOpt

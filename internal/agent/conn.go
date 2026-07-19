@@ -406,7 +406,7 @@ func translate(u sdk.SessionUpdate) (Event, bool) {
 		if title == "" {
 			return nil, false
 		}
-		return SessionInfoUpdated{Title: title}, true
+		return SessionRenamed{Name: title}, true
 	case u.ToolCall != nil:
 		return ToolCallBegan{
 			ID:     string(u.ToolCall.ToolCallId),
