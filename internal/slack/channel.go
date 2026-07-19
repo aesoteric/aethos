@@ -32,6 +32,8 @@ type sessionTarget interface {
 	Get(context.Context, string) (session.Record, error)
 	FindByTopic(context.Context, string, string) (session.Record, error)
 	Rename(context.Context, string, string) (session.Record, error)
+	List(context.Context) ([]session.Record, error)
+	CloseSession(context.Context, string) (session.Record, error)
 }
 
 // Settings contains the credentials and access policy needed by the Slack
@@ -338,6 +340,16 @@ func (c *Channel) handleEvent(ctx context.Context, payload json.RawMessage) erro
 		if err != nil {
 			return err
 		}
+		if record.State == session.Closed {
+			_, err := c.client.PostMessage(
+				ctx,
+				c.settings.BotToken,
+				c.settings.ChannelID,
+				event.ThreadTS,
+				"This Session is closed. Start a new Session to continue.",
+			)
+			return err
+		}
 		return c.enqueuePrompt(ctx, inboundPrompt{
 			destination: sessionThread{sessionID: record.ID, threadTS: event.ThreadTS},
 			text:        text,
@@ -350,8 +362,18 @@ func (c *Channel) handleEvent(ctx context.Context, payload json.RawMessage) erro
 	if command == "agents" {
 		return c.sendAgentList(ctx)
 	}
+	if command == "sessions" {
+		return c.sendSessionList(ctx)
+	}
+	if command == "close" {
+		return c.closeSession(ctx, argument)
+	}
 	_, err := c.client.PostMessage(
-		ctx, c.settings.BotToken, c.settings.ChannelID, "", "Send agents to list installed Agents.",
+		ctx,
+		c.settings.BotToken,
+		c.settings.ChannelID,
+		"",
+		"Send agents to list installed Agents, new to create a Session, sessions to list Sessions, or close <Session ID> to close one.",
 	)
 	return err
 }
@@ -528,6 +550,15 @@ func (c *Channel) Send(ctx context.Context, event channeltypes.Event) error {
 	}
 	if record.Owner.Channel != channelName || record.TopicKey == "" {
 		return nil
+	}
+	if update, ok := event.AgentEvent.(agent.SessionInfoUpdated); ok {
+		record, err = c.sessions.Rename(ctx, record.ID, update.Title)
+		if err != nil {
+			return err
+		}
+		return c.client.UpdateMessage(
+			ctx, c.settings.BotToken, c.settings.ChannelID, record.TopicKey, rootText(record),
+		)
 	}
 	fragment := renderEvent(event.AgentEvent)
 	if fragment.text == "" {
@@ -802,6 +833,81 @@ func (c *Channel) sendAgentList(ctx context.Context) error {
 		fmt.Fprintf(&text, "\n%s — %s (%s)", installedAgent.ID, installedAgent.Name, installedAgent.Type)
 	}
 	_, err := c.client.PostMessage(ctx, c.settings.BotToken, c.settings.ChannelID, "", text.String())
+	return err
+}
+
+func (c *Channel) sendSessionList(ctx context.Context) error {
+	records, err := c.sessions.List(ctx)
+	if err != nil {
+		return err
+	}
+	if len(records) == 0 {
+		_, err := c.client.PostMessage(
+			ctx, c.settings.BotToken, c.settings.ChannelID, "", "No Sessions.",
+		)
+		return err
+	}
+	if _, err := c.client.PostMessage(
+		ctx, c.settings.BotToken, c.settings.ChannelID, "", "Sessions:",
+	); err != nil {
+		return err
+	}
+	for _, record := range records {
+		name := strings.TrimSpace(record.Name)
+		if name == "" {
+			name = "(unnamed)"
+		}
+		text := fmt.Sprintf(
+			"%s\nState: %s\nAgent: %s\nName: %s",
+			record.ID,
+			record.State,
+			record.Agent,
+			name,
+		)
+		if _, err := c.client.PostMessage(
+			ctx, c.settings.BotToken, c.settings.ChannelID, "", text,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Channel) closeSession(ctx context.Context, id string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		_, err := c.client.PostMessage(
+			ctx, c.settings.BotToken, c.settings.ChannelID, "", "Usage: close <Session ID>",
+		)
+		return err
+	}
+	record, err := c.sessions.CloseSession(ctx, id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			_, sendErr := c.client.PostMessage(
+				ctx, c.settings.BotToken, c.settings.ChannelID, "", "Session not found: "+id,
+			)
+			return sendErr
+		}
+		if errors.Is(err, session.ErrInvalidTransition) {
+			_, sendErr := c.client.PostMessage(
+				ctx, c.settings.BotToken, c.settings.ChannelID, "", "Session is already closed: "+id,
+			)
+			return sendErr
+		}
+		return err
+	}
+	name := strings.TrimSpace(record.Name)
+	if name == "" {
+		name = record.ID
+	}
+	_, err = c.client.PostMessage(
+		ctx,
+		c.settings.BotToken,
+		c.settings.ChannelID,
+		"",
+		fmt.Sprintf("Session closed: %s (%s).", name, record.ID),
+	)
 	return err
 }
 

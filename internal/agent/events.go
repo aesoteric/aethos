@@ -15,6 +15,9 @@ type Thought struct{ Text string }
 // Message is a chunk of the agent's response text.
 type Message struct{ Text string }
 
+// SessionInfoUpdated reports an Agent-provided title for the Session.
+type SessionInfoUpdated struct{ Title string }
+
 // ToolCallBegan announces a tool call the agent has initiated.
 type ToolCallBegan struct {
 	ID     string
@@ -88,6 +91,7 @@ type Crashed struct{ Error string }
 
 func (Thought) isEvent()             {}
 func (Message) isEvent()             {}
+func (SessionInfoUpdated) isEvent()  {}
 func (ToolCallBegan) isEvent()       {}
 func (ToolCallProgressed) isEvent()  {}
 func (PermissionRequested) isEvent() {}

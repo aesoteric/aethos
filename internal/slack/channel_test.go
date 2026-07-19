@@ -76,7 +76,10 @@ func TestAssistantListsInstalledAgentsAndRepliesWithUsage(t *testing.T) {
 
 	waitFor(t, func() bool {
 		return api.hasPost("C0123456789", "Installed Agents:\ncodex-acp — Codex (npx)\ngoose — goose (binary)") &&
-			api.hasPost("C0123456789", "Send agents to list installed Agents.")
+			api.hasPost(
+				"C0123456789",
+				"Send agents to list installed Agents, new to create a Session, sessions to list Sessions, or close <Session ID> to close one.",
+			)
 	})
 	cancel()
 	if err := <-done; err != nil {
@@ -260,6 +263,7 @@ type slackFixtureAPI struct {
 
 	mu               sync.Mutex
 	scripts          []socketScript
+	envelopes        chan string
 	calls            []slackCall
 	acknowledgements []string
 	connections      int
@@ -268,7 +272,10 @@ type slackFixtureAPI struct {
 
 func newSlackFixtureAPI(t *testing.T, scripts ...socketScript) *slackFixtureAPI {
 	t.Helper()
-	api := &slackFixtureAPI{scripts: append([]socketScript(nil), scripts...)}
+	api := &slackFixtureAPI{
+		scripts:   append([]socketScript(nil), scripts...),
+		envelopes: make(chan string, 16),
+	}
 	api.server = httptest.NewServer(http.HandlerFunc(api.handle))
 	t.Cleanup(api.server.Close)
 	return api
@@ -326,34 +333,58 @@ func (a *slackFixtureAPI) handleSocket(w http.ResponseWriter, r *http.Request) {
 	a.mu.Unlock()
 
 	for _, envelope := range script.envelopes {
-		if err := connection.Write(r.Context(), websocket.MessageText, []byte(envelope)); err != nil {
+		if err := a.writeEnvelope(r.Context(), connection, envelope); err != nil {
 			return
 		}
-		var decoded struct {
-			EnvelopeID string `json:"envelope_id"`
-		}
-		if json.Unmarshal([]byte(envelope), &decoded) != nil || decoded.EnvelopeID == "" {
-			continue
-		}
-		_, acknowledgement, err := connection.Read(r.Context())
-		if err != nil {
-			return
-		}
-		var ack struct {
-			EnvelopeID string `json:"envelope_id"`
-		}
-		if json.Unmarshal(acknowledgement, &ack) != nil {
-			return
-		}
-		a.mu.Lock()
-		a.acknowledgements = append(a.acknowledgements, ack.EnvelopeID)
-		a.mu.Unlock()
 	}
 	if script.drop {
 		_ = connection.CloseNow()
 		return
 	}
-	_, _, _ = connection.Read(r.Context())
+	for {
+		select {
+		case envelope := <-a.envelopes:
+			if err := a.writeEnvelope(r.Context(), connection, envelope); err != nil {
+				return
+			}
+		case <-r.Context().Done():
+			return
+		}
+	}
+}
+
+func (a *slackFixtureAPI) writeEnvelope(
+	ctx context.Context,
+	connection *websocket.Conn,
+	envelope string,
+) error {
+	if err := connection.Write(ctx, websocket.MessageText, []byte(envelope)); err != nil {
+		return err
+	}
+	var decoded struct {
+		EnvelopeID string `json:"envelope_id"`
+	}
+	if json.Unmarshal([]byte(envelope), &decoded) != nil || decoded.EnvelopeID == "" {
+		return nil
+	}
+	_, acknowledgement, err := connection.Read(ctx)
+	if err != nil {
+		return err
+	}
+	var ack struct {
+		EnvelopeID string `json:"envelope_id"`
+	}
+	if json.Unmarshal(acknowledgement, &ack) != nil {
+		return fmt.Errorf("decode Slack acknowledgement")
+	}
+	a.mu.Lock()
+	a.acknowledgements = append(a.acknowledgements, ack.EnvelopeID)
+	a.mu.Unlock()
+	return nil
+}
+
+func (a *slackFixtureAPI) sendEnvelope(envelope string) {
+	a.envelopes <- envelope
 }
 
 func (a *slackFixtureAPI) hasAcknowledgement(envelopeID string) bool {

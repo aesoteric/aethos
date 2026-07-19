@@ -401,6 +401,12 @@ func translate(u sdk.SessionUpdate) (Event, bool) {
 		return Thought{Text: contentText(u.AgentThoughtChunk.Content)}, true
 	case u.AgentMessageChunk != nil:
 		return Message{Text: contentText(u.AgentMessageChunk.Content)}, true
+	case u.SessionInfoUpdate != nil && u.SessionInfoUpdate.Title != nil:
+		title := strings.TrimSpace(*u.SessionInfoUpdate.Title)
+		if title == "" {
+			return nil, false
+		}
+		return SessionInfoUpdated{Title: title}, true
 	case u.ToolCall != nil:
 		return ToolCallBegan{
 			ID:     string(u.ToolCall.ToolCallId),
