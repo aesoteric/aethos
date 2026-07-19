@@ -26,6 +26,14 @@ type SlackTokenValidator interface {
 	ValidateBotToken(context.Context, string) error
 }
 
+type tokenPrompt struct {
+	environmentName string
+	question        string
+	label           string
+	validateFormat  func(string) error
+	validateLive    func(context.Context, string) error
+}
+
 // AgentChoice is one installed Agent offered by the setup wizard.
 type AgentChoice struct {
 	ID   string
@@ -58,7 +66,13 @@ func RunWizard(
 		if telegramValidator == nil {
 			return Config{}, fmt.Errorf("Telegram token validator is required")
 		}
-		token, fromEnvironment, collectErr := interaction.collectTelegramToken(ctx, telegramValidator)
+		token, fromEnvironment, collectErr := interaction.collectToken(ctx, tokenPrompt{
+			environmentName: botTokenEnv,
+			question:        "Telegram bot token: ",
+			label:           "Telegram bot token",
+			validateFormat:  validateRequiredToken,
+			validateLive:    telegramValidator.ValidateToken,
+		})
 		if collectErr != nil {
 			return Config{}, collectErr
 		}
@@ -82,18 +96,24 @@ func RunWizard(
 		if slackValidator == nil {
 			return Config{}, fmt.Errorf("Slack token validator is required")
 		}
-		appToken, fromEnvironment, collectErr := interaction.collectSlackToken(
-			ctx, slackAppTokenEnv, "Slack app-level token: ", "Slack app-level token", "xapp-",
-			slackValidator.ValidateAppToken,
-		)
+		appToken, fromEnvironment, collectErr := interaction.collectToken(ctx, tokenPrompt{
+			environmentName: slackAppTokenEnv,
+			question:        "Slack app-level token: ",
+			label:           "Slack app-level token",
+			validateFormat:  validateSlackTokenFormat("xapp-"),
+			validateLive:    slackValidator.ValidateAppToken,
+		})
 		if collectErr != nil {
 			return Config{}, collectErr
 		}
 		slackAppTokenFromEnvironment = fromEnvironment
-		botToken, fromEnvironment, collectErr := interaction.collectSlackToken(
-			ctx, slackBotTokenEnv, "Slack bot token: ", "Slack bot token", "xoxb-",
-			slackValidator.ValidateBotToken,
-		)
+		botToken, fromEnvironment, collectErr := interaction.collectToken(ctx, tokenPrompt{
+			environmentName: slackBotTokenEnv,
+			question:        "Slack bot token: ",
+			label:           "Slack bot token",
+			validateFormat:  validateSlackTokenFormat("xoxb-"),
+			validateLive:    slackValidator.ValidateBotToken,
+		})
 		if collectErr != nil {
 			return Config{}, collectErr
 		}
@@ -264,65 +284,55 @@ func (i wizardInteraction) collectTelegramAllowedUserIDs() ([]int64, error) {
 	}
 }
 
-func (i wizardInteraction) collectTelegramToken(
+func (i wizardInteraction) collectToken(
 	ctx context.Context,
-	validator TelegramTokenValidator,
+	prompt tokenPrompt,
 ) (token string, fromEnvironment bool, err error) {
-	if value, ok := nonEmptyEnvironment(botTokenEnv); ok {
-		fmt.Fprintf(i.output, "Validating Telegram bot token from %s...\n", botTokenEnv)
-		if err := validator.ValidateToken(ctx, value); err != nil {
-			return "", false, fmt.Errorf("%s is not a valid Telegram bot token: %w", botTokenEnv, err)
+	if value, ok := nonEmptyEnvironment(prompt.environmentName); ok {
+		fmt.Fprintf(i.output, "Validating %s from %s...\n", prompt.label, prompt.environmentName)
+		if err := prompt.validateFormat(value); err != nil {
+			return "", false, fmt.Errorf(
+				"%s is not a valid %s: %w", prompt.environmentName, prompt.label, err,
+			)
+		}
+		if err := prompt.validateLive(ctx, value); err != nil {
+			return "", false, fmt.Errorf(
+				"%s is not a valid %s: %w", prompt.environmentName, prompt.label, err,
+			)
 		}
 		return value, true, nil
 	}
 
 	for {
-		value, err := i.prompt("Telegram bot token: ")
+		value, err := i.prompt(prompt.question)
 		if err != nil {
 			return "", false, err
 		}
-		if value == "" {
-			fmt.Fprintln(i.output, "A Telegram bot token is required.")
+		if err := prompt.validateFormat(value); err != nil {
+			fmt.Fprintf(i.output, "%s %v. Try again.\n", prompt.label, err)
 			continue
 		}
-		if err := validator.ValidateToken(ctx, value); err != nil {
-			fmt.Fprintf(i.output, "Telegram bot token rejected: %v. Try again.\n", err)
+		if err := prompt.validateLive(ctx, value); err != nil {
+			fmt.Fprintf(i.output, "%s rejected: %v. Try again.\n", prompt.label, err)
 			continue
 		}
 		return value, false, nil
 	}
 }
 
-func (i wizardInteraction) collectSlackToken(
-	ctx context.Context,
-	envName, question, label, prefix string,
-	validate func(context.Context, string) error,
-) (token string, fromEnvironment bool, err error) {
-	if value, ok := nonEmptyEnvironment(envName); ok {
-		fmt.Fprintf(i.output, "Validating %s from %s...\n", label, envName)
-		if !validSlackToken(value, prefix) {
-			return "", false, fmt.Errorf("%s is not a valid %s", envName, label)
-		}
-		if err := validate(ctx, value); err != nil {
-			return "", false, fmt.Errorf("%s is not a valid %s: %w", envName, label, err)
-		}
-		return value, true, nil
+func validateRequiredToken(value string) error {
+	if value == "" {
+		return fmt.Errorf("is required")
 	}
+	return nil
+}
 
-	for {
-		value, err := i.prompt(question)
-		if err != nil {
-			return "", false, err
-		}
+func validateSlackTokenFormat(prefix string) func(string) error {
+	return func(value string) error {
 		if !validSlackToken(value, prefix) {
-			fmt.Fprintf(i.output, "%s must start with %s and contain no spaces. Try again.\n", label, prefix)
-			continue
+			return fmt.Errorf("must start with %s and contain no spaces", prefix)
 		}
-		if err := validate(ctx, value); err != nil {
-			fmt.Fprintf(i.output, "%s rejected: %v. Try again.\n", label, err)
-			continue
-		}
-		return value, false, nil
+		return nil
 	}
 }
 
