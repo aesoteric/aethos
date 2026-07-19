@@ -97,24 +97,28 @@ type Channel struct {
 	workers  sync.WaitGroup
 }
 
-type inboundPrompt struct {
+type sessionThread struct {
 	sessionID string
 	threadTS  string
-	text      string
+}
+
+type inboundPrompt struct {
+	destination sessionThread
+	text        string
 }
 
 type messageDraft struct {
-	threadTS string
-	chunks   []draftChunk
-	lastKind fragmentKind
-	dirty    bool
-	updated  chan struct{}
+	destination sessionThread
+	chunks      []draftChunk
+	lastKind    fragmentKind
+	dirty       bool
+	updated     chan struct{}
 }
 
 type draftChunk struct {
-	text string
-	ts   string
-	sent string
+	text         string
+	messageTS    string
+	lastSentText string
 }
 
 type fragmentKind uint8
@@ -335,9 +339,8 @@ func (c *Channel) handleEvent(ctx context.Context, payload json.RawMessage) erro
 			return err
 		}
 		return c.enqueuePrompt(ctx, inboundPrompt{
-			sessionID: record.ID,
-			threadTS:  event.ThreadTS,
-			text:      text,
+			destination: sessionThread{sessionID: record.ID, threadTS: event.ThreadTS},
+			text:        text,
 		})
 	}
 	command, argument, _ := strings.Cut(strings.TrimSpace(event.Text), " ")
@@ -355,14 +358,14 @@ func (c *Channel) handleEvent(ctx context.Context, payload json.RawMessage) erro
 
 func (c *Channel) enqueuePrompt(ctx context.Context, prompt inboundPrompt) error {
 	c.mu.Lock()
-	lane := c.lanes[prompt.threadTS]
+	lane := c.lanes[prompt.destination.threadTS]
 	if lane == nil {
 		lane = make(chan inboundPrompt, 64)
-		c.lanes[prompt.threadTS] = lane
+		c.lanes[prompt.destination.threadTS] = lane
 		c.workers.Add(1)
 		go func() {
 			defer c.workers.Done()
-			c.runPromptLane(ctx, prompt.threadTS, lane)
+			c.runPromptLane(ctx, prompt.destination.threadTS, lane)
 		}()
 	}
 	c.mu.Unlock()
@@ -391,25 +394,25 @@ func (c *Channel) runPromptLane(ctx context.Context, threadTS string, lane <-cha
 }
 
 func (c *Channel) handlePrompt(ctx context.Context, prompt inboundPrompt) {
-	record, err := c.sessions.Get(ctx, prompt.sessionID)
+	record, err := c.sessions.Get(ctx, prompt.destination.sessionID)
 	if err != nil {
-		c.reportPromptError(ctx, prompt.threadTS, err)
+		c.reportPromptError(ctx, prompt.destination.threadTS, err)
 		return
 	}
 	if record.Name == "" {
 		record, err = c.sessions.Rename(ctx, record.ID, sessionName(prompt.text))
 		if err != nil {
-			c.reportPromptError(ctx, prompt.threadTS, err)
+			c.reportPromptError(ctx, prompt.destination.threadTS, err)
 			return
 		}
 		if err := c.client.UpdateMessage(
-			ctx, c.settings.BotToken, c.settings.ChannelID, prompt.threadTS, rootText(record),
+			ctx, c.settings.BotToken, c.settings.ChannelID, prompt.destination.threadTS, rootText(record),
 		); err != nil {
-			c.logger.Warn("rename Slack Session thread", "session", record.ID, "thread_ts", prompt.threadTS, "error", err)
+			c.logger.Warn("rename Slack Session thread", "session", record.ID, "thread_ts", prompt.destination.threadTS, "error", err)
 		}
 	}
 	if _, err := c.sessions.Prompt(ctx, record.ID, prompt.text); err != nil && !errors.Is(err, context.Canceled) {
-		c.logger.Error("Slack Prompt failed", "session", record.ID, "thread_ts", prompt.threadTS, "error", err)
+		c.logger.Error("Slack Prompt failed", "session", record.ID, "thread_ts", prompt.destination.threadTS, "error", err)
 	}
 }
 
@@ -510,7 +513,7 @@ func (c *Channel) sessionSelection(argument string) (string, string, error) {
 			return workspace, agentID, nil
 		}
 	}
-	return "", "", fmt.Errorf("Agent %q is not installed", agentID)
+	return "", "", fmt.Errorf("agent %q is not installed", agentID)
 }
 
 // Send implements channel.Channel. Agent events are accumulated in a draft so
@@ -530,7 +533,7 @@ func (c *Channel) Send(ctx context.Context, event channeltypes.Event) error {
 	if fragment.text == "" {
 		return nil
 	}
-	c.appendDraft(record.ID, record.TopicKey, fragment)
+	c.appendDraft(sessionThread{sessionID: record.ID, threadTS: record.TopicKey}, fragment)
 	return nil
 }
 
@@ -552,7 +555,7 @@ func (c *Channel) SendLifecycle(ctx context.Context, event channeltypes.Lifecycl
 			ctx, c.settings.BotToken, c.settings.ChannelID, record.TopicKey, rootText(record),
 		)
 	case channeltypes.PromptStarted:
-		c.beginDraft(record.ID, record.TopicKey)
+		c.beginDraft(sessionThread{sessionID: record.ID, threadTS: record.TopicKey})
 		_, err := c.client.PostMessage(
 			ctx, c.settings.BotToken, c.settings.ChannelID, record.TopicKey, "Prompt started.",
 		)
@@ -582,22 +585,22 @@ func (c *Channel) sessionRecord(ctx context.Context, sessionID string) (session.
 	return sessions.Get(ctx, sessionID)
 }
 
-func (c *Channel) beginDraft(sessionID, threadTS string) {
+func (c *Channel) beginDraft(destination sessionThread) {
 	c.mu.Lock()
-	c.drafts[sessionID] = newMessageDraft(threadTS)
+	c.drafts[destination.sessionID] = newMessageDraft(destination)
 	c.mu.Unlock()
 }
 
-func newMessageDraft(threadTS string) *messageDraft {
-	return &messageDraft{threadTS: threadTS, updated: make(chan struct{}, 1)}
+func newMessageDraft(destination sessionThread) *messageDraft {
+	return &messageDraft{destination: destination, updated: make(chan struct{}, 1)}
 }
 
-func (c *Channel) appendDraft(sessionID, threadTS string, fragment eventFragment) {
+func (c *Channel) appendDraft(destination sessionThread, fragment eventFragment) {
 	c.mu.Lock()
-	draft := c.drafts[sessionID]
+	draft := c.drafts[destination.sessionID]
 	if draft == nil {
-		draft = newMessageDraft(threadTS)
-		c.drafts[sessionID] = draft
+		draft = newMessageDraft(destination)
+		c.drafts[destination.sessionID] = draft
 	}
 	continuous := fragment.kind == draft.lastKind &&
 		(fragment.kind == thoughtFragment || fragment.kind == messageFragment)
@@ -646,12 +649,11 @@ func (c *Channel) stream(ctx context.Context) {
 }
 
 type draftWrite struct {
-	sessionID string
-	draft     *messageDraft
-	index     int
-	threadTS  string
-	messageTS string
-	text      string
+	destination sessionThread
+	draft       *messageDraft
+	index       int
+	messageTS   string
+	text        string
 }
 
 func (c *Channel) flushOne(ctx context.Context) {
@@ -663,7 +665,7 @@ func (c *Channel) flushOne(ctx context.Context) {
 	var posted Message
 	if write.messageTS == "" {
 		posted, err = c.client.PostMessage(
-			ctx, c.settings.BotToken, c.settings.ChannelID, write.threadTS, write.text,
+			ctx, c.settings.BotToken, c.settings.ChannelID, write.destination.threadTS, write.text,
 		)
 	} else {
 		err = c.client.UpdateMessage(
@@ -671,21 +673,21 @@ func (c *Channel) flushOne(ctx context.Context) {
 		)
 	}
 	if err != nil {
-		c.logger.Warn("stream Agent output to Slack", "session", write.sessionID, "error", err)
+		c.logger.Warn("stream Agent output to Slack", "session", write.destination.sessionID, "error", err)
 		return
 	}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	current := c.drafts[write.sessionID]
+	current := c.drafts[write.destination.sessionID]
 	if current != write.draft || write.index >= len(current.chunks) {
 		return
 	}
 	chunk := &current.chunks[write.index]
-	if write.messageTS == "" && chunk.ts == "" {
-		chunk.ts = posted.TS
+	if write.messageTS == "" && chunk.messageTS == "" {
+		chunk.messageTS = posted.TS
 	}
-	chunk.sent = write.text
+	chunk.lastSentText = write.text
 	current.dirty = draftNeedsWrite(current)
 	notifyDraft(current)
 }
@@ -693,19 +695,18 @@ func (c *Channel) flushOne(ctx context.Context) {
 func (c *Channel) nextDraftWrite() (draftWrite, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for sessionID, draft := range c.drafts {
+	for _, draft := range c.drafts {
 		if !draft.dirty {
 			continue
 		}
 		for index, chunk := range draft.chunks {
-			if chunk.ts == "" || chunk.sent != chunk.text {
+			if chunk.messageTS == "" || chunk.lastSentText != chunk.text {
 				return draftWrite{
-					sessionID: sessionID,
-					draft:     draft,
-					index:     index,
-					threadTS:  draft.threadTS,
-					messageTS: chunk.ts,
-					text:      chunk.text,
+					destination: draft.destination,
+					draft:       draft,
+					index:       index,
+					messageTS:   chunk.messageTS,
+					text:        chunk.text,
 				}, true
 			}
 		}
@@ -717,7 +718,7 @@ func (c *Channel) nextDraftWrite() (draftWrite, bool) {
 
 func draftNeedsWrite(draft *messageDraft) bool {
 	for _, chunk := range draft.chunks {
-		if chunk.ts == "" || chunk.sent != chunk.text {
+		if chunk.messageTS == "" || chunk.lastSentText != chunk.text {
 			return true
 		}
 	}
@@ -749,32 +750,32 @@ func (c *Channel) waitForDraft(ctx context.Context, sessionID string) error {
 	}
 }
 
-func renderEvent(event agent.Event) eventFragment {
-	switch one := event.(type) {
+func renderEvent(agentEvent agent.Event) eventFragment {
+	switch event := agentEvent.(type) {
 	case agent.Thought:
-		return eventFragment{kind: thoughtFragment, text: one.Text}
+		return eventFragment{kind: thoughtFragment, text: event.Text}
 	case agent.Message:
-		return eventFragment{kind: messageFragment, text: one.Text}
+		return eventFragment{kind: messageFragment, text: event.Text}
 	case agent.ToolCallBegan:
-		line := "Tool: " + one.Title
-		if one.Kind != "" {
-			line += " [" + one.Kind + "]"
+		line := "Tool: " + event.Title
+		if event.Kind != "" {
+			line += " [" + event.Kind + "]"
 		}
-		if one.Status != "" {
-			line += " — " + one.Status
+		if event.Status != "" {
+			line += " — " + event.Status
 		}
 		return eventFragment{kind: discreteFragment, text: line}
 	case agent.ToolCallProgressed:
 		line := "Tool update"
-		if one.Title != "" {
-			line += ": " + one.Title
+		if event.Title != "" {
+			line += ": " + event.Title
 		}
-		if one.Status != "" {
-			line += " — " + one.Status
+		if event.Status != "" {
+			line += " — " + event.Status
 		}
 		return eventFragment{kind: discreteFragment, text: line}
 	case agent.Crashed:
-		return eventFragment{kind: discreteFragment, text: "Agent stopped: " + one.Error}
+		return eventFragment{kind: discreteFragment, text: "Agent stopped: " + event.Error}
 	default:
 		return eventFragment{}
 	}

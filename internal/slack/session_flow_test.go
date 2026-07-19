@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,14 +18,12 @@ func TestSlackFlowCreatesSessionBoundToFreshThread(t *testing.T) {
 	workspace := t.TempDir()
 	api := newSlackFixtureAPI(t, socketScript{envelopes: []string{
 		`{"type":"hello","connection_info":{"app_id":"A0123456789"}}`,
-		messageEnvelope("new-envelope", "U0123456789", "C0123456789", "new "+workspace+" | codex-acp", ""),
+		messageEnvelope("new-envelope", "U0123456789", "C0123456789", "new "+workspace+" | goose", ""),
 	}})
 	bridge := newSlackChannel(t, api)
 	manager := openSlackSessionManager(t, bridge, &agent.Script{})
 
-	ctx, cancel := context.WithCancel(t.Context())
-	done := make(chan error, 1)
-	go func() { done <- bridge.Run(ctx, manager) }()
+	stop := startSlackFlow(t, bridge, manager)
 
 	waitFor(t, func() bool {
 		records, err := manager.List(t.Context())
@@ -36,7 +35,7 @@ func TestSlackFlowCreatesSessionBoundToFreshThread(t *testing.T) {
 		t.Fatalf("list Slack Sessions: %v", err)
 	}
 	record := records[0]
-	if record.Agent != "codex-acp" || record.Workspace != workspace {
+	if record.Agent != "goose" || record.Workspace != workspace {
 		t.Errorf("Session selection = Agent %q Workspace %q, want command choices", record.Agent, record.Workspace)
 	}
 	if record.Owner != (session.Owner{Channel: "slack", ID: "U0123456789"}) {
@@ -52,10 +51,7 @@ func TestSlackFlowCreatesSessionBoundToFreshThread(t *testing.T) {
 		t.Error("Slack Channel did not post the ready notice in the new Session thread")
 	}
 
-	cancel()
-	if err := <-done; err != nil {
-		t.Fatalf("run Slack Channel: %v", err)
-	}
+	stop()
 }
 
 func TestSlackFlowAnswersInvalidSessionSelectionsInChannel(t *testing.T) {
@@ -73,7 +69,7 @@ func TestSlackFlowAnswersInvalidSessionSelectionsInChannel(t *testing.T) {
 		{
 			name:      "Agent",
 			selection: workspace + " | missing-agent",
-			wantReply: `Agent "missing-agent" is not installed`,
+			wantReply: `agent "missing-agent" is not installed`,
 		},
 	}
 	for _, test := range tests {
@@ -85,9 +81,7 @@ func TestSlackFlowAnswersInvalidSessionSelectionsInChannel(t *testing.T) {
 			bridge := newSlackChannelWithDefaults(t, api, workspace)
 			manager := openSlackSessionManager(t, bridge, &agent.Script{})
 
-			ctx, cancel := context.WithCancel(t.Context())
-			done := make(chan error, 1)
-			go func() { done <- bridge.Run(ctx, manager) }()
+			stop := startSlackFlow(t, bridge, manager)
 
 			waitFor(t, func() bool { return api.hasPostContaining("C0123456789", test.wantReply) })
 			records, err := manager.List(t.Context())
@@ -98,10 +92,7 @@ func TestSlackFlowAnswersInvalidSessionSelectionsInChannel(t *testing.T) {
 				t.Errorf("created %d Sessions for invalid %s selection, want none", len(records), strings.ToLower(test.name))
 			}
 
-			cancel()
-			if err := <-done; err != nil {
-				t.Fatalf("run Slack Channel: %v", err)
-			}
+			stop()
 		})
 	}
 }
@@ -115,9 +106,7 @@ func TestSlackFlowCreatesSessionWithDefaults(t *testing.T) {
 	bridge := newSlackChannelWithDefaults(t, api, workspace)
 	manager := openSlackSessionManager(t, bridge, &agent.Script{})
 
-	ctx, cancel := context.WithCancel(t.Context())
-	done := make(chan error, 1)
-	go func() { done <- bridge.Run(ctx, manager) }()
+	stop := startSlackFlow(t, bridge, manager)
 
 	waitFor(t, func() bool {
 		records, err := manager.List(t.Context())
@@ -131,10 +120,7 @@ func TestSlackFlowCreatesSessionWithDefaults(t *testing.T) {
 		t.Errorf("Session selection = Agent %q Workspace %q, want configured defaults", records[0].Agent, records[0].Workspace)
 	}
 
-	cancel()
-	if err := <-done; err != nil {
-		t.Fatalf("run Slack Channel: %v", err)
-	}
+	stop()
 }
 
 func TestSlackFlowDispatchesThreadPromptsSerially(t *testing.T) {
@@ -165,9 +151,7 @@ func TestSlackFlowDispatchesThreadPromptsSerially(t *testing.T) {
 	bridge := newSlackChannelWithDefaults(t, api, workspace)
 	manager := openSlackSessionManager(t, bridge, &script)
 
-	ctx, cancel := context.WithCancel(t.Context())
-	done := make(chan error, 1)
-	go func() { done <- bridge.Run(ctx, manager) }()
+	stop := startSlackFlow(t, bridge, manager)
 
 	select {
 	case <-firstStarted:
@@ -192,10 +176,7 @@ func TestSlackFlowDispatchesThreadPromptsSerially(t *testing.T) {
 			api.hasUpdate(threadTS, "first Prompt\nState: live")
 	})
 
-	cancel()
-	if err := <-done; err != nil {
-		t.Fatalf("run Slack Channel: %v", err)
-	}
+	stop()
 }
 
 func TestSlackFlowStreamsChunkedOutputAndSurfacesPromptLifecycle(t *testing.T) {
@@ -218,9 +199,7 @@ func TestSlackFlowStreamsChunkedOutputAndSurfacesPromptLifecycle(t *testing.T) {
 	bridge := newSlackChannelWithDefaults(t, api, workspace, slack.WithWriteInterval(5*time.Millisecond))
 	manager := openSlackSessionManager(t, bridge, &script)
 
-	ctx, cancel := context.WithCancel(t.Context())
-	done := make(chan error, 1)
-	go func() { done <- bridge.Run(ctx, manager) }()
+	stop := startSlackFlow(t, bridge, manager)
 
 	waitFor(t, func() bool {
 		return api.hasThreadPost(threadTS, "Prompt started.") &&
@@ -238,10 +217,7 @@ func TestSlackFlowStreamsChunkedOutputAndSurfacesPromptLifecycle(t *testing.T) {
 		t.Error("PromptFinished was posted before the final draft edit")
 	}
 
-	cancel()
-	if err := <-done; err != nil {
-		t.Fatalf("run Slack Channel: %v", err)
-	}
+	stop()
 }
 
 func TestSlackFlowSurfacesPromptFinishedError(t *testing.T) {
@@ -256,9 +232,7 @@ func TestSlackFlowSurfacesPromptFinishedError(t *testing.T) {
 	bridge := newSlackChannelWithDefaults(t, api, workspace, slack.WithWriteInterval(5*time.Millisecond))
 	manager := openSlackSessionManager(t, bridge, &script)
 
-	ctx, cancel := context.WithCancel(t.Context())
-	done := make(chan error, 1)
-	go func() { done <- bridge.Run(ctx, manager) }()
+	stop := startSlackFlow(t, bridge, manager)
 
 	waitFor(t, func() bool {
 		return api.hasThreadPostContaining(
@@ -267,10 +241,25 @@ func TestSlackFlowSurfacesPromptFinishedError(t *testing.T) {
 		)
 	})
 
-	cancel()
-	if err := <-done; err != nil {
-		t.Fatalf("run Slack Channel: %v", err)
+	stop()
+}
+
+func startSlackFlow(t *testing.T, bridge *slack.Channel, manager *session.Manager) func() {
+	t.Helper()
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- bridge.Run(ctx, manager) }()
+	var once sync.Once
+	stop := func() {
+		once.Do(func() {
+			cancel()
+			if err := <-done; err != nil {
+				t.Errorf("run Slack Channel: %v", err)
+			}
+		})
 	}
+	t.Cleanup(stop)
+	return stop
 }
 
 func openSlackSessionManager(t *testing.T, bridge *slack.Channel, script *agent.Script) *session.Manager {
