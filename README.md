@@ -4,7 +4,7 @@ A self-hosted bridge that connects AI coding agents — Claude Code, Codex, Gemi
 
 [![CI](https://github.com/aesoteric/aethos/actions/workflows/ci.yml/badge.svg)](https://github.com/aesoteric/aethos/actions/workflows/ci.yml)
 
-> **Release line: v0.1.0.** Tag pushes publish archives for Linux and macOS on
+> **Release line: v0.2.0.** Tag pushes publish archives for Linux and macOS on
 > amd64 and arm64, together with a multi-architecture distroless image. The
 > [v1 spec](https://github.com/aesoteric/aethos/issues/1) tracks what comes next.
 
@@ -22,7 +22,7 @@ that may use aethos.
 Download the archive for the current machine and verify its checksum:
 
 ```sh
-version=0.1.0
+version=0.2.0
 os="$(uname -s | tr '[:upper:]' '[:lower:]')"
 case "$(uname -m)" in
   x86_64|amd64) arch=amd64 ;;
@@ -71,7 +71,7 @@ For Docker, systemd, upgrades, and backup paths, see
 [release smoke checklist](docs/release-smoke.md) with real Telegram and Agent
 credentials before accepting a release.
 
-## What v0.1.0 includes
+## What v0.2.0 includes
 
 - **Telegram**: each Session lives in its own forum Topic; agent output (thinking, tool calls, text) streams in as it happens; risky actions pause on approve/deny buttons.
 - **Slack**: each Session lives in a thread in one configured channel; the Assistant uses top-level messages and Session controls use buttons.

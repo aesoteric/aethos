@@ -166,7 +166,7 @@ mkdir -p "$PWD/aethos-data/aethos" "$PWD/aethos-data/home" "$PWD/aethos-data/wor
 docker run --rm \
   --user "$(id -u):$(id -g)" \
   --mount "type=bind,src=$PWD/aethos-data,dst=/data" \
-  ghcr.io/aesoteric/aethos:0.1.0 agents install opencode
+  ghcr.io/aesoteric/aethos:0.2.0 agents install opencode
 ```
 
 Configure any credentials required by that Agent under `aethos-data/home`, or
@@ -178,7 +178,7 @@ docker run --rm -it \
   --name aethos \
   --user "$(id -u):$(id -g)" \
   --mount "type=bind,src=$PWD/aethos-data,dst=/data" \
-  ghcr.io/aesoteric/aethos:0.1.0
+  ghcr.io/aesoteric/aethos:0.2.0
 ```
 
 After the wizard writes `config.toml`, aethos starts immediately. Stop it with
@@ -190,7 +190,7 @@ docker run -d \
   --restart unless-stopped \
   --user "$(id -u):$(id -g)" \
   --mount "type=bind,src=$PWD/aethos-data,dst=/data" \
-  ghcr.io/aesoteric/aethos:0.1.0
+  ghcr.io/aesoteric/aethos:0.2.0
 ```
 
 Use `docker logs -f aethos` for structured logs. To upgrade, pull a new image,
