@@ -6,6 +6,141 @@ Workspace on storage you back up. The SQLite database, configuration, installed
 Agent, Agent state, and Workspace are the only persistent state in the examples
 below.
 
+## Slack Channel
+
+The Slack Channel uses Socket Mode, so Slack connects to aethos over an outbound
+WebSocket and no public HTTP endpoint is required. One configured Slack channel
+hosts the Assistant at its top level and one Session Topic, implemented as a
+Slack thread, per Session.
+
+### Create the Slack app
+
+1. Open [Slack app settings](https://api.slack.com/apps), select **Create New
+   App**, choose **From a manifest**, and select the workspace where aethos will
+   run. Slack's [manifest guide](https://docs.slack.dev/app-manifests/configuring-apps-with-app-manifests/)
+   describes the same creation flow.
+2. Select JSON, paste this manifest, review the requested features and scopes,
+   then create the app:
+
+```json
+{
+  "_metadata": {
+    "major_version": 1
+  },
+  "display_information": {
+    "name": "aethos",
+    "description": "Self-hosted bridge from Slack to ACP coding Agents"
+  },
+  "features": {
+    "bot_user": {
+      "display_name": "aethos",
+      "always_online": false
+    }
+  },
+  "oauth_config": {
+    "scopes": {
+      "bot": [
+        "channels:history",
+        "chat:write",
+        "groups:history"
+      ]
+    }
+  },
+  "settings": {
+    "event_subscriptions": {
+      "bot_events": [
+        "message.channels",
+        "message.groups"
+      ]
+    },
+    "interactivity": {
+      "is_enabled": true
+    },
+    "org_deploy_enabled": false,
+    "socket_mode_enabled": true,
+    "token_rotation_enabled": false
+  }
+}
+```
+
+The history scopes and matching events let aethos receive Prompts from public
+and private Slack channels; `chat:write` lets it post and update its own output.
+See Slack's references for [`message.channels`](https://docs.slack.dev/reference/events/message.channels/),
+[`message.groups`](https://docs.slack.dev/reference/events/message.groups/),
+and [`chat:write`](https://docs.slack.dev/reference/scopes/chat.write/).
+Interactivity delivers Cancel and permission button presses over the same
+Socket Mode connection.
+
+### Collect the credentials and IDs
+
+1. On the app's **Basic Information** page, find **App-Level Tokens**, select
+   **Generate Token and Scopes**, add `connections:write`, and generate the
+   token. Save the `xapp-...` value as the app-level token. Slack documents this
+   token as the credential for
+   [`apps.connections.open`](https://docs.slack.dev/reference/scopes/connections.write/).
+2. Open **OAuth & Permissions**, select **Install to Workspace**, approve the
+   requested scopes, and copy the **Bot User OAuth Token** beginning with
+   `xoxb-`. Slack's [Socket Mode setup](https://docs.slack.dev/apis/events-api/using-socket-mode/)
+   distinguishes these two tokens and requires no Request URL.
+3. Create or choose the Slack channel aethos will use, then invite the app's bot
+   user with `/invite @aethos`. Membership lets the app read and write there
+   without the broader `chat:write.public` scope.
+4. Right-click the Slack channel name, select **View channel details**, and copy
+   the channel ID at the bottom. It begins with `C` or `G`; it is also the last
+   segment of the [channel URL](https://docs.slack.dev/messaging/formatting-message-text/#linking-to-channels).
+5. For every person allowed to use aethos, open their Slack profile, select
+   **More**, then **Copy member ID**. Slack user IDs normally begin with `U` or
+   `W`. Only these IDs will be allowed to use the Assistant, send Prompts, or
+   press Session controls.
+
+Treat both tokens as passwords. The recommended setup keeps them out of
+`config.toml`:
+
+```sh
+export AETHOS_SLACK_APP_TOKEN='xapp-your-app-level-token'
+export AETHOS_SLACK_BOT_TOKEN='xoxb-your-bot-token'
+```
+
+For Docker, put the same `NAME=value` entries in a mode-`0600` file and pass it
+with `--env-file` to both the wizard and background container. For systemd, use
+`/etc/aethos/aethos.env` as described below.
+
+### Configure and run aethos
+
+Install an Agent before the first start, then run the wizard:
+
+```sh
+aethos agents
+aethos agents install codex-acp
+aethos
+```
+
+Authenticate the installed Agent according to its own documentation before
+creating a Session.
+
+Choose **Slack**, enter the channel ID and comma-separated allowed user IDs,
+then select the default Agent and Workspace. The wizard validates both Slack
+tokens live. When they came from the environment, it writes empty token values
+so the secrets remain outside the file. The resulting Slack section has this
+shape:
+
+```toml
+workspace = "/absolute/path/to/workspace"
+default_agent = "codex-acp"
+
+[slack]
+app_token = ""
+bot_token = ""
+channel_id = "C0123456789"
+allowed_user_ids = ["U0123456789", "U9876543210"]
+```
+
+Start aethos with the same token environment. At the top level of the configured
+Slack channel, use `agents`, `new`, `sessions`, or `close <Session ID>` with the
+Assistant. `new` creates a Session Topic; send the first Prompt as a reply in
+that Topic. Agent output and lifecycle updates appear there, with Cancel and
+permission controls when applicable.
+
 ## Docker
 
 The published image is `ghcr.io/aesoteric/aethos:<version>`. It is a
@@ -123,5 +258,5 @@ sudo journalctl -u aethos -f
 ```
 
 CI verifies the unit with `systemd-analyze` on Ubuntu and the release checklist
-exercises startup, Telegram delivery, restart, and Session durability on a real
-systemd host before a release is accepted.
+exercises startup, Telegram and Slack delivery, restart, and Session durability
+on real hosts before a release is accepted.

@@ -16,6 +16,8 @@ commit, hosts, and Agent below so another operator can reproduce the result.
 - ACP Agent ID and version: `opencode` 1.18.3
 - Telegram bot and forum group (non-secret identifiers only): `@aesoteric_bot`,
   `-1004460169089`
+- Slack workspace, app, and channel (non-secret identifiers only): not exercised
+  in v0.1.0; record these for the first release containing the Slack Channel
 
 ## Published artifacts
 
@@ -53,6 +55,41 @@ tools by default, so its smoke Workspace used this `opencode.json`:
       Agent receives that choice.
 - [x] Restart aethos, send another Prompt in the same Topic, and confirm the
       dormant Session resumes its Agent context.
+
+## Real Slack and Agent
+
+The recorded v0.1.0 run predates the Slack Channel. These checks are the release
+gate for the first Slack-capable release and remain required for every later
+release.
+
+- [ ] From a clean Slack app, follow the manifest walkthrough in
+      [deployment.md](deployment.md#slack-channel); confirm Socket Mode, both
+      channel message events, interactivity, and only the documented bot scopes
+      are enabled.
+- [ ] Generate the `connections:write` app-level token, install the app to obtain
+      its bot token, invite the bot user to the chosen Slack channel, and record
+      the non-secret workspace, app, channel, and allowlisted user IDs above.
+- [ ] Create a fresh aethos data directory, install the recorded Agent, and run
+      the wizard for a Slack-only deployment using environment-sourced tokens.
+      Confirm the generated `config.toml` contains neither token.
+- [ ] Confirm aethos connects through Socket Mode without a public endpoint and
+      `agents` at the top level receives the installed Agent list from the
+      Assistant.
+- [ ] Send `new`, confirm a Session Topic appears, then send a first Prompt in
+      that Topic. Confirm the Agent starts, streams output, and reports the
+      Prompt's terminal result there.
+- [ ] Start another Prompt, press Cancel before it finishes, and confirm the
+      Agent receives cancellation and the stale control disappears.
+- [ ] Trigger an Agent permission request, approve or deny it with the Slack
+      buttons, and confirm the Agent receives that choice and the buttons are
+      replaced by the outcome.
+- [ ] Confirm `sessions` lists the Session with state, Agent, name, and ID; then
+      use `close <Session ID>` and confirm the closed Session rejects a plain
+      Prompt in its Topic.
+- [ ] From a Slack user absent from `allowed_user_ids`, try the Assistant, a
+      Session Prompt, and a button press; confirm aethos produces no reaction.
+- [ ] Restart aethos, send a Prompt in a dormant Session Topic, and confirm the
+      same Agent context resumes.
 
 ## One-volume Docker deployment
 
