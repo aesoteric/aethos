@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"slices"
 	"sync"
+	"time"
 
 	sdk "github.com/coder/acp-go-sdk"
 )
@@ -21,8 +22,11 @@ type Turn struct {
 	Continue    <-chan struct{}
 	Permissions []ScriptedPermission
 	Events      []Event
-	Stop        StopReason
-	Crash       bool
+	// EventInterval spaces scripted events so flow tests can observe streaming
+	// behavior at a real Channel's write boundary.
+	EventInterval time.Duration
+	Stop          StopReason
+	Crash         bool
 }
 
 // ScriptedPermission asks the real ACP client for permission during a scripted
@@ -276,12 +280,34 @@ func (a *scriptedAgent) Prompt(ctx context.Context, p sdk.PromptRequest) (sdk.Pr
 		}
 	}
 
-	for _, ev := range turn.Events {
+	for index, ev := range turn.Events {
 		if err := a.conn.SessionUpdate(ctx, sdk.SessionNotification{
 			SessionId: p.SessionId,
 			Update:    untranslate(ev),
 		}); err != nil {
 			return sdk.PromptResponse{}, err
+		}
+		if turn.EventInterval > 0 && index+1 < len(turn.Events) {
+			timer := time.NewTimer(turn.EventInterval)
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				return sdk.PromptResponse{}, ctx.Err()
+			case <-cancelled:
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				return sdk.PromptResponse{}, context.Canceled
+			}
 		}
 	}
 	return sdk.PromptResponse{StopReason: sdk.StopReason(turn.Stop)}, nil

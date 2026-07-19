@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aesoteric/aethos/internal/agent"
 	"github.com/aesoteric/aethos/internal/agentcatalog"
 	"github.com/aesoteric/aethos/internal/slack"
 	"github.com/coder/websocket"
@@ -31,9 +32,10 @@ func TestSocketModeAcknowledgesEnvelopesAndReconnectsAfterDrop(t *testing.T) {
 		},
 	)
 	bridge := newSlackChannel(t, api, slack.WithReconnectBackoff(25*time.Millisecond, 25*time.Millisecond))
+	manager := openSlackSessionManager(t, bridge, &agent.Script{})
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
-	go func() { done <- bridge.Run(ctx) }()
+	go func() { done <- bridge.Run(ctx, manager) }()
 
 	waitFor(t, func() bool {
 		return api.hasAcknowledgement("envelope-1") && api.connectionCount() >= 2
@@ -67,9 +69,10 @@ func TestAssistantListsInstalledAgentsAndRepliesWithUsage(t *testing.T) {
 		messageEnvelope("usage-envelope", "U0123456789", "C0123456789", "what now", ""),
 	}})
 	bridge := newSlackChannel(t, api)
+	manager := openSlackSessionManager(t, bridge, &agent.Script{})
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
-	go func() { done <- bridge.Run(ctx) }()
+	go func() { done <- bridge.Run(ctx, manager) }()
 
 	waitFor(t, func() bool {
 		return api.hasPost("C0123456789", "Installed Agents:\ncodex-acp — Codex (npx)\ngoose — goose (binary)") &&
@@ -109,9 +112,10 @@ func TestSlackChannelSilentlyIgnoresRejectedMessages(t *testing.T) {
 		messageEnvelope("thread-envelope", "U0123456789", "C0123456789", "agents", "1750000000.000003"),
 	}})
 	bridge := newSlackChannel(t, api)
+	manager := openSlackSessionManager(t, bridge, &agent.Script{})
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
-	go func() { done <- bridge.Run(ctx) }()
+	go func() { done <- bridge.Run(ctx, manager) }()
 
 	waitFor(t, func() bool {
 		for _, envelopeID := range []string{
@@ -145,9 +149,10 @@ func TestSocketModeReconnectsAfterSlackRefreshRequest(t *testing.T) {
 		}},
 	)
 	bridge := newSlackChannel(t, api, slack.WithReconnectBackoff(25*time.Millisecond, 25*time.Millisecond))
+	manager := openSlackSessionManager(t, bridge, &agent.Script{})
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
-	go func() { done <- bridge.Run(ctx) }()
+	go func() { done <- bridge.Run(ctx, manager) }()
 
 	waitFor(t, func() bool {
 		return api.connectionCount() >= 2 && api.hasAcknowledgement("after-refresh-envelope") &&
@@ -168,6 +173,16 @@ func TestSocketModeReconnectsAfterSlackRefreshRequest(t *testing.T) {
 
 func newSlackChannel(t *testing.T, api *slackFixtureAPI, options ...slack.Option) *slack.Channel {
 	t.Helper()
+	return newSlackChannelWithDefaults(t, api, "/workspace", options...)
+}
+
+func newSlackChannelWithDefaults(
+	t *testing.T,
+	api *slackFixtureAPI,
+	workspace string,
+	options ...slack.Option,
+) *slack.Channel {
+	t.Helper()
 	if len(options) == 0 {
 		options = []slack.Option{slack.WithReconnectBackoff(time.Millisecond, 5*time.Millisecond)}
 	}
@@ -179,6 +194,8 @@ func newSlackChannel(t *testing.T, api *slackFixtureAPI, options ...slack.Option
 			BotToken:       "xoxb-test-token",
 			ChannelID:      "C0123456789",
 			AllowedUserIDs: []string{"U0123456789"},
+			DefaultAgent:   "codex-acp",
+			Workspace:      workspace,
 			Agents: staticAgentCatalog{
 				{ID: "codex-acp", Name: "Codex", Type: agentcatalog.NPX},
 				{ID: "goose", Name: "goose", Type: agentcatalog.Binary},
@@ -234,6 +251,7 @@ type slackCall struct {
 	method        string
 	authorization string
 	body          map[string]any
+	responseTS    string
 	at            time.Time
 }
 
@@ -245,6 +263,7 @@ type slackFixtureAPI struct {
 	calls            []slackCall
 	acknowledgements []string
 	connections      int
+	nextMessage      int
 }
 
 func newSlackFixtureAPI(t *testing.T, scripts ...socketScript) *slackFixtureAPI {
@@ -267,8 +286,13 @@ func (a *slackFixtureAPI) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.mu.Lock()
+	responseTS := ""
+	if method == "chat.postMessage" {
+		a.nextMessage++
+		responseTS = fmt.Sprintf("1750000001.%06d", a.nextMessage)
+	}
 	a.calls = append(a.calls, slackCall{
-		method: method, authorization: r.Header.Get("Authorization"), body: body, at: time.Now(),
+		method: method, authorization: r.Header.Get("Authorization"), body: body, responseTS: responseTS, at: time.Now(),
 	})
 	a.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
@@ -278,7 +302,7 @@ func (a *slackFixtureAPI) handle(w http.ResponseWriter, r *http.Request) {
 	case "apps.connections.open":
 		fmt.Fprintf(w, `{"ok":true,"url":%q}`, strings.Replace(a.server.URL, "http://", "ws://", 1)+"/socket")
 	case "chat.postMessage":
-		fmt.Fprint(w, `{"ok":true,"channel":"C0123456789","ts":"1750000001.000001"}`)
+		fmt.Fprintf(w, `{"ok":true,"channel":"C0123456789","ts":%q}`, responseTS)
 	case "chat.update":
 		fmt.Fprint(w, `{"ok":true,"channel":"C0123456789","ts":"1750000001.000001"}`)
 	default:
@@ -384,6 +408,83 @@ func (a *slackFixtureAPI) hasPost(channelID, text string) bool {
 		}
 	}
 	return false
+}
+
+func (a *slackFixtureAPI) hasPostContaining(channelID, text string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, call := range a.calls {
+		bodyText, _ := call.body["text"].(string)
+		if call.method == "chat.postMessage" && call.body["channel"] == channelID && strings.Contains(bodyText, text) {
+			if threadTS, present := call.body["thread_ts"]; !present || threadTS == "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (a *slackFixtureAPI) hasThreadPost(threadTS, text string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, call := range a.calls {
+		if call.method == "chat.postMessage" && call.body["thread_ts"] == threadTS && call.body["text"] == text {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *slackFixtureAPI) hasThreadPostContaining(threadTS, text string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, call := range a.calls {
+		bodyText, _ := call.body["text"].(string)
+		if call.method == "chat.postMessage" && call.body["thread_ts"] == threadTS && strings.Contains(bodyText, text) {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *slackFixtureAPI) hasUpdate(timestamp, text string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, call := range a.calls {
+		if call.method == "chat.update" && call.body["ts"] == timestamp && call.body["text"] == text {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *slackFixtureAPI) threadPostTimestamp(threadTS, text string) string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, call := range a.calls {
+		if call.method == "chat.postMessage" && call.body["thread_ts"] == threadTS && call.body["text"] == text {
+			return call.responseTS
+		}
+	}
+	return ""
+}
+
+func (a *slackFixtureAPI) updatePrecedesThreadPost(
+	timestamp, updateText, threadTS, postText string,
+) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	updateIndex := -1
+	postIndex := -1
+	for index, call := range a.calls {
+		if call.method == "chat.update" && call.body["ts"] == timestamp && call.body["text"] == updateText {
+			updateIndex = index
+		}
+		if call.method == "chat.postMessage" && call.body["thread_ts"] == threadTS && call.body["text"] == postText {
+			postIndex = index
+		}
+	}
+	return updateIndex >= 0 && postIndex > updateIndex
 }
 
 func (a *slackFixtureAPI) hasCall(method, authorization string, body map[string]any) bool {

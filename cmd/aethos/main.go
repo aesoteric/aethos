@@ -238,13 +238,16 @@ func runApplication(
 			BotToken:       configured.Slack.BotToken,
 			ChannelID:      configured.Slack.ChannelID,
 			AllowedUserIDs: configured.Slack.AllowedUserIDs,
+			DefaultAgent:   configured.DefaultAgent,
+			Workspace:      configured.Workspace,
 			Agents:         catalog,
 		})
 		if slackErr != nil {
 			return errors.Join(slackErr, closeTelegram(telegramChannel))
 		}
-		runners = append(runners, func(runCtx context.Context, _ *session.Manager) error {
-			return slackChannel.Run(runCtx)
+		routes["slack"] = slackChannel
+		runners = append(runners, func(runCtx context.Context, manager *session.Manager) error {
+			return slackChannel.Run(runCtx, manager)
 		})
 	}
 	if configured.REST != nil {
